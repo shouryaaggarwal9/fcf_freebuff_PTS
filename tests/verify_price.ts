@@ -4,14 +4,14 @@
  * 1. Golden vectors — price(symbol, sec) must EXACTLY match the pinned
  *    fixture (catches any accidental history rewrite).
  * 2. Tick rule — every price is a multiple of 5 paise (₹0.05).
- * 3. Monotonicity — inside each 60 s anchor segment the price path is
- *    monotone; the settlement oracle relies on this to binary-search.
+ * 3. Monotonicity — inside each ANCHOR_GRID (10 s in v2) segment the price
+ *    path is monotone; the settlement oracle relies on this to binary-search.
  * 4. Day-boundary continuity — no artificial gap at 00:00 UTC.
  * 5. Oracle — findFillTick/firstTickWhere agrees with a brute-force scan
  *    over the same window (this is what settles orders retroactively).
  */
 import { MARKET_VERSION, SYMBOLS, TICK_PAISE } from "../src/config/market";
-import { firstTickWhere, pricePaise } from "../src/engine/price";
+import { ANCHOR_GRID, firstTickWhere, pricePaise } from "../src/engine/price";
 import { floorDiv } from "../src/engine/math";
 
 const DAY0 = 1_728_000_000n; // UTC start-of-day used by the fixture
@@ -59,11 +59,13 @@ for (const v of fixture.vectors) {
   );
 }
 
-/* 2. monotonicity within 60 s segments (across a day boundary and mid-epoch) */
+/* 2. monotonicity within anchor-grid segments (across a day boundary and
+ *    mid-epoch). The segment length IS the oracle's binary-search domain —
+ *    it must track ANCHOR_GRID, never a hardcoded constant. */
 for (const def of SYMBOLS) {
-  for (const segStart of [DAY0 - 120n, DAY0, 1_699_999_980n, WINDOW_FROM]) {
+  for (const segStart of [DAY0 - ANCHOR_GRID * 2n, DAY0, 1_699_999_980n, WINDOW_FROM]) {
     const diffs: bigint[] = [];
-    for (let s = segStart; s < segStart + 60n; s++) {
+    for (let s = segStart; s < segStart + ANCHOR_GRID; s++) {
       diffs.push(pricePaise(def.symbol, s + 1n) - pricePaise(def.symbol, s));
     }
     const nonNeg = diffs.every((d) => d >= 0n);

@@ -67,8 +67,16 @@ const schema = defineSchema(
 
     /**
      * Orders. Status: OPEN | FILLED | CANCELLED | EXPIRED.
-     * Reason: MANUAL | DAY_END. Open buy orders reserve cash; open sell
-     * orders reserve held quantity. Realized P&L is stored at fill time.
+     * Reason: MANUAL | DAY_END | AUTO. Open buy orders reserve cash; open
+     * sell orders reserve held quantity (short-entry sells reserve 2×
+     * notional margin instead). Realized P&L is stored at fill time — on
+     * SELL exits AND on BUY cover fills of short positions. AUTO marks the
+     * synthetic auto-cover stop the engine keeps at 2× a short's avg entry.
+     *
+     * ocoId links OCO bracket legs (e.g. SL-sell + target-sell on one
+     * holding). Sibling legs share the id; the fill path cancels the
+     * survivors when one leg fills. Capacity counting is group-aware:
+     * see src/lib/oco.ts.
      */
     orders: defineTable({
       userId: v.id("users"),
@@ -89,7 +97,13 @@ const schema = defineSchema(
       fillEpochSec: v.optional(v.number()),
       fillPricePaise: v.optional(v.bigint()),
       filledMs: v.optional(v.number()),
-      reason: v.string(), // MANUAL | DAY_END
+      reason: v.string(), // MANUAL | DAY_END | AUTO
+      /** Placement-time meaning: OPEN_SHORT | ADD_SHORT | EXIT_LONG |
+       *  COVER_SHORT | OPEN_LONG | ADD_LONG. Lets the backstop and UI tell
+       *  long-exit sells apart from short-entry sells. */
+      intent: v.optional(v.string()),
+      /** OCO bracket group id (present only on bracket legs). */
+      ocoId: v.optional(v.string()),
       /** Stored realized P&L (paise) for SELL fills — never recomputed. */
       realizedPnlPaise: v.optional(v.bigint()),
       /** Average cost of the position sold against (entry price for /pnl). */
@@ -99,14 +113,25 @@ const schema = defineSchema(
       .index("by_user_status", ["userId", "status"])
       .index("by_user_day", ["userId", "dayStartSec"])
       .index("by_user_symbol_day", ["userId", "symbol", "dayStartSec"])
-      .index("by_user_created", ["userId", "createdMs"]),
+      .index("by_user_created", ["userId", "createdMs"])
+      .index("by_oco", ["userId", "ocoId"]),
 
-    /** Intraday positions: one row per (user, symbol, day) while qty > 0. */
+    /**
+     * Intraday positions: one row per (user, symbol, day) while qty > 0.
+     *
+     * side: LONG | SHORT. marginPaise is the cash blocked by the position —
+     * LONG: total entry notional (already spent). SHORT: 2 × entry notional
+     * (release at cover fully funds the worst-case cover payment, so the
+     * wallet can never go negative; max loss = ½ margin at the 2× auto-cover
+     * stop). See src/lib/position.ts for the locked policy.
+     */
     positions: defineTable({
       userId: v.id("users"),
       symbol: v.string(),
       dayStartSec: v.number(),
       qty: v.number(),
+      side: v.optional(v.string()), // LONG | SHORT (absent = LONG, legacy rows)
+      marginPaise: v.optional(v.bigint()), // blocked margin (see above)
       avgCostPaise: v.bigint(),
       openedOrderId: v.optional(v.id("orders")),
       createdMs: v.number(),

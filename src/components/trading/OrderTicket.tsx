@@ -18,6 +18,7 @@ import {
 } from "@/components/ui/select";
 import { SYMBOLS, TICK_PAISE } from "@/config/market";
 import { pricePaise } from "@/engine/price";
+import { orderIntent } from "@/lib/position";
 import { cn } from "@/lib/utils";
 import { formatINR, parseINRToPaise } from "@/lib/format";
 import { Loader2, Zap } from "lucide-react";
@@ -38,7 +39,11 @@ interface OrderTicketProps {
   onSymbolChange: (symbol: string) => void;
   nowSec: number;
   availableCashPaise: bigint;
-  heldQty: number; // today's held qty for the selected symbol
+  heldQty: number; // today's position qty for the selected symbol (0 = flat)
+  positionSide: "LONG" | "SHORT" | null; // null = flat
+  /** Resting unlinked orders per side — the OCO partner candidate. */
+  pendingBuyQty: number;
+  pendingSellQty: number;
   onPlace: (args: {
     symbol: string;
     side: Side;
@@ -63,6 +68,9 @@ export function OrderTicket({
   nowSec,
   availableCashPaise,
   heldQty,
+  positionSide,
+  pendingBuyQty,
+  pendingSellQty,
   onPlace,
   prefill,
   className,
@@ -99,11 +107,22 @@ export function OrderTicket({
         : spot;
 
   const qty = /^\d+$/.test(qtyStr.trim()) ? parseInt(qtyStr.trim(), 10) : 0;
+  const isShort = positionSide === "SHORT";
+  const shorting = side === "SELL" && !isShort; // FLAT/LONG + SELL means short-entry only when flat
+  const opensShort = side === "SELL" && positionSide === null;
+  const coversShort = side === "BUY" && isShort;
+  const intent = orderIntent(
+    positionSide === null ? null : { side: positionSide, qty: heldQty },
+    side,
+  );
   const maxBuyQty =
-    isBuy && pricePaiseValue > 0n
+    isBuy && pricePaiseValue > 0n && !isShort
       ? availableCashPaise / pricePaiseValue
       : 0n;
   const notional = BigInt(qty) * pricePaiseValue;
+  // Margin preview: shorts block 2× notional (+ headroom when resting).
+  const marginEstimate =
+    opensShort || intent === "ADD_SHORT" ? 2n * notional + (kind === "MARKET" ? 0n : 2n * BigInt(qty) * 100n) : 0n;
 
   const error = useMemo<string | null>(() => {
     if (qty <= 0 || qty > 1_000_000) return "Enter a valid quantity (1–10,00,000).";
@@ -121,10 +140,21 @@ export function OrderTicket({
       if (side === "BUY" && levelPaise <= spot)
         return "Buy stop must be above the current market price.";
     }
-    if (side === "SELL" && qty > heldQty)
+    if (coversShort && qty > heldQty)
+      return `Short is ${heldQty} ${symbol} — buying more would flip the position.`;
+    if (side === "SELL" && isShort)
+      return `You are SHORT ${heldQty} ${symbol} — selling adds to the short (margin 2× notional).`;
+    if (
+      side === "SELL" &&
+      !opensShort &&
+      !isShort &&
+      qty > heldQty
+    )
       return `You hold ${heldQty} ${symbol} today — sell quantity exceeds it.`;
-    if (side === "BUY" && notional > availableCashPaise)
+    if (side === "BUY" && !coversShort && notional > availableCashPaise)
       return `Needs ${formatINR(notional)} — above available cash ${formatINR(availableCashPaise)}.`;
+    if ((opensShort || intent === "ADD_SHORT") && marginEstimate > availableCashPaise)
+      return `Needs ${formatINR(marginEstimate)} margin — above available cash ${formatINR(availableCashPaise)}.`;
     return null;
   }, [
     qty,
@@ -135,6 +165,11 @@ export function OrderTicket({
     symbol,
     notional,
     availableCashPaise,
+    coversShort,
+    opensShort,
+    isShort,
+    marginEstimate,
+    spot,
     spot,
   ]);
 
@@ -251,9 +286,13 @@ export function OrderTicket({
             Quantity
           </label>
           <span className="text-[10px] text-muted-foreground">
-            {isBuy
-              ? `Cash ${formatINR(availableCashPaise)}`
-              : `Held ${heldQty} ${symbol}`}
+            {isShort
+              ? `SHORT ${heldQty} · margin ${formatINR(availableCashPaise)} cash`
+              : isBuy
+                ? `Cash ${formatINR(availableCashPaise)}`
+                : heldQty > 0
+                  ? `LONG ${heldQty} ${symbol}`
+                  : "Flat — SELL opens a short"}
           </span>
         </div>
         <Input
@@ -334,11 +373,13 @@ export function OrderTicket({
               -0.5%
             </button>
             <span className="ml-auto self-center text-[10px] text-muted-foreground">
-              {kind === "STOP"
-                ? side === "SELL"
-                  ? "protects a long position"
-                  : "enters above the market"
-                : "resting limit — fills when price reaches level"}
+              {side === "SELL" && pendingSellQty > 0
+                ? `OCO bracket — pairs with the resting ${pendingSellQty} qty sell (first trigger wins, other cancels)`
+                : kind === "STOP"
+                  ? side === "SELL"
+                    ? "protects a long position"
+                    : "enters above the market"
+                  : "resting limit — fills when price reaches level"}
             </span>
           </div>
         </div>
@@ -347,17 +388,28 @@ export function OrderTicket({
       {/* Estimate */}
       <div className="rounded-lg border border-border bg-muted/30 px-3 py-2 text-[11px] text-muted-foreground">
         <div className="flex justify-between">
-          <span>Est. {kind === "MARKET" ? "value @ LTP" : "value @ level"}</span>
+          <span>
+            {opensShort || intent === "ADD_SHORT"
+              ? "Margin (2× notional"
+              : "Est. " + (kind === "MARKET" ? "value @ LTP" : "value @ level")}
+            {opensShort || intent === "ADD_SHORT" ? (kind === "MARKET" ? " @ LTP)" : " + headroom)") : ""}
+          </span>
           <span className="tnum font-mono font-semibold text-foreground">
-            {qty > 0 ? formatINR(notional) : "—"}
+            {qty > 0
+              ? formatINR(opensShort || intent === "ADD_SHORT" ? marginEstimate : notional)
+              : "—"}
           </span>
         </div>
         <div className="mt-1 flex justify-between">
           <span>P&L basis</span>
           <span>
-            {side === "SELL"
-              ? "Realized on fill vs. avg cost"
-              : "Unrealized while held"}
+            {coversShort
+              ? "Realized on cover vs. short avg"
+              : opensShort || intent === "ADD_SHORT"
+                ? "Realized on cover; max loss ½ margin (auto-cover 2×)"
+                : side === "SELL"
+                  ? "Realized on fill vs. avg cost"
+                  : "Unrealized while held"}
           </span>
         </div>
       </div>

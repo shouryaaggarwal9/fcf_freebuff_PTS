@@ -10,8 +10,12 @@
  */
 import { describe, expect, test } from "bun:test";
 import { SYMBOLS, TICK_PAISE } from "../src/config/market";
-import { candleSeries, extendLiveSeries } from "../src/engine/candles";
+import { buildCandles, candleSeries, extendLiveSeries } from "../src/engine/candles";
+import { depthAt, DEPTH_LEVELS } from "../src/engine/depth";
 import { floorDiv } from "../src/engine/math";
+import { committedQty, isOcoEnabled, validateOcoLevels } from "../src/lib/oco";
+import { pricePaise } from "../src/engine/price";
+import { applyTrade, autoCoverStopPaise, orderIntent } from "../src/lib/position";
 import { firstTickWhere, pricePaise } from "../src/engine/price";
 
 const T0 = 1_735_680_000n; // a fixed modern epoch
@@ -141,11 +145,310 @@ describe("candle builder", () => {
   });
 });
 
+describe("synthetic depth ladder", () => {
+  const T = 1_735_680_123n;
+
+  test("is deterministic and pure for (symbol, second)", () => {
+    for (const sym of SYMBOLS.slice(0, 4)) {
+      const a = depthAt(sym.symbol, Number(T));
+      const b = depthAt(sym.symbol, Number(T));
+      expect(a).toEqual(b);
+    }
+  });
+
+  test("bids strictly decrease, asks strictly increase, all multiples of the tick", () => {
+    for (const sym of SYMBOLS) {
+      for (let off = 0; off < 300; off += 97) {
+        const d = depthAt(sym.symbol, Number(T) + off);
+        expect(d.bids.length).toBe(DEPTH_LEVELS);
+        expect(d.asks.length).toBe(DEPTH_LEVELS);
+        for (let i = 0; i < DEPTH_LEVELS; i++) {
+          expect(d.bids[i].pricePaise % TICK).toBe(0n);
+          expect(d.asks[i].pricePaise % TICK).toBe(0n);
+          if (i > 0) {
+            expect(d.bids[i].pricePaise).toBeLessThan(d.bids[i - 1].pricePaise);
+            expect(d.asks[i].pricePaise).toBeGreaterThan(d.asks[i - 1].pricePaise);
+          }
+        }
+        expect(d.bids[0].pricePaise).toBeLessThan(d.asks[0].pricePaise);
+      }
+    }
+  });
+
+  test("ladder straddles the spot and sizes are positive", () => {
+    for (const sym of SYMBOLS.slice(0, 5)) {
+      const s = pricePaise(sym.symbol, T);
+      const d = depthAt(sym.symbol, Number(T));
+      expect(d.bids[0].pricePaise).toBeLessThan(s);
+      expect(d.asks[0].pricePaise).toBeGreaterThan(s);
+      for (const lvl of [...d.bids, ...d.asks]) {
+        expect(lvl.qty).toBeGreaterThan(0);
+        expect(lvl.orders).toBeGreaterThan(0);
+      }
+    }
+  });
+});
+
 describe("math helpers", () => {
   test("floorDiv floors toward negative infinity", () => {
     expect(floorDiv(7n, 3n)).toBe(2n);
     expect(floorDiv(-7n, 3n)).toBe(-3n);
     expect(floorDiv(7n, -3n)).toBe(-3n);
     expect(floorDiv(0n, 5n)).toBe(0n);
+  });
+});
+
+describe("OCO bracket helpers", () => {
+  test("lone sells commit their full quantity", () => {
+    expect(
+      committedQty([
+        { ocoId: null, qty: 10 },
+        { ocoId: null, qty: 5 },
+      ]),
+    ).toBe(15);
+  });
+
+  test("a bracket group commits only its minimum leg", () => {
+    expect(
+      committedQty([
+        { ocoId: "g", qty: 10 },
+        { ocoId: "g", qty: 10 },
+      ]),
+    ).toBe(10);
+  });
+
+  test("asymmetric legs commit the smaller leg", () => {
+    expect(
+      committedQty([
+        { ocoId: "g", qty: 10 },
+        { ocoId: "g", qty: 6 },
+      ]),
+    ).toBe(6);
+  });
+
+  test("mixed groups and lone sells sum correctly", () => {
+    expect(
+      committedQty([
+        { ocoId: "g1", qty: 10 },
+        { ocoId: "g1", qty: 4 },
+        { ocoId: null, qty: 5 },
+      ]),
+    ).toBe(9);
+  });
+
+  test("separate groups never merge", () => {
+    expect(
+      committedQty([
+        { ocoId: "g1", qty: 10 },
+        { ocoId: "g1", qty: 4 },
+        { ocoId: "g2", qty: 7 },
+        { ocoId: "g2", qty: 7 },
+      ]),
+    ).toBe(11);
+  });
+
+  test("same ocoId on different symbols/days is two independent groups", () => {
+    expect(
+      committedQty([
+        { ocoId: "g", qty: 10, symbol: "A", dayStartSec: 1 },
+        { ocoId: "g", qty: 10, symbol: "B", dayStartSec: 1 },
+      ]),
+    ).toBe(20);
+    expect(
+      committedQty([
+        { ocoId: "g", qty: 10, symbol: "A", dayStartSec: 1 },
+        { ocoId: "g", qty: 10, symbol: "A", dayStartSec: 2 },
+      ]),
+    ).toBe(20);
+  });
+
+  test("group capacity never exceeds held quantity — the 1-qty edge", () => {
+    // 1 held share with a 2-leg bracket commits exactly 1.
+    expect(
+      committedQty([
+        { ocoId: "g", qty: 1 },
+        { ocoId: "g", qty: 1 },
+      ]),
+    ).toBe(1);
+  });
+
+  test("bracket level sanity: stop below spot, target above stop", () => {
+    const spot = 100_000n;
+    expect(validateOcoLevels(spot, 90_000n, 110_000n)).toBeNull();
+    expect(validateOcoLevels(spot, 100_000n, 110_000n)).toMatch(/below/i);
+    expect(validateOcoLevels(spot, 110_000n, 110_000n)).toMatch(/below/i);
+    expect(validateOcoLevels(spot, 90_000n, 90_000n)).toMatch(/above/i);
+  });
+
+  test("brackets require at least two legs", () => {
+    expect(isOcoEnabled(1)).toBe(false);
+    expect(isOcoEnabled(2)).toBe(true);
+  });
+});
+
+describe("market realism (v2 generator)", () => {
+  const DAY0 = 1_728_000_000n;
+
+  test("1m/5m candles carry wicks on every symbol", () => {
+    for (const def of SYMBOLS) {
+      for (const tf of [60, 300]) {
+        const cs = buildCandles(def.symbol, Number(DAY0), Number(DAY0) + 86_400, tf);
+        expect(cs.length).toBeGreaterThan(1000 / (tf / 60));
+        let wicky = 0;
+        for (const c of cs) {
+          const body = c.openPaise > c.closePaise ? c.openPaise : c.closePaise;
+          const foot = c.openPaise < c.closePaise ? c.openPaise : c.closePaise;
+          if (c.highPaise > body || c.lowPaise < foot) wicky += 1;
+        }
+        // Interior 10 s curvature makes the overwhelming majority of bars
+        // non-monotone. (v1: exactly zero — the bug this pins.)
+        expect(wicky, `${def.symbol} ${tf}s`).toBeGreaterThan(cs.length * 3 / 5);
+      }
+    }
+  });
+
+  test("1m candle colors decorrelate across minutes", () => {
+    const cs = buildCandles("RELIANCE", Number(DAY0), Number(DAY0) + 86_400 * 3, 60);
+    expect(cs.length).toBeGreaterThan(4_000);
+    const up = (c: { openPaise: bigint; closePaise: bigint }) =>
+      c.closePaise >= c.openPaise;
+    let maxRun = 1;
+    let run = 1;
+    let flips = 0;
+    for (let i = 1; i < cs.length; i += 1) {
+      if (up(cs[i]) === up(cs[i - 1])) {
+        run += 1;
+      } else {
+        flips += 1;
+        if (run > maxRun) maxRun = run;
+        run = 1;
+      }
+    }
+    // Independent per-minute anchors: most adjacent candles differ in color,
+    // and no streak dominates the day. (v1: max run = 10 by construction.)
+    expect(maxRun).toBeLessThanOrEqual(12);
+    expect(flips * 2).toBeGreaterThan(cs.length);
+  });
+
+  test("price is continuous across the 00:00 UTC day boundary", () => {
+    for (const def of SYMBOLS) {
+      const a = pricePaise(def.symbol, DAY0 - 1n);
+      const b = pricePaise(def.symbol, DAY0);
+      const jump = b > a ? b - a : a - b;
+      // A boundary tick must not exceed ordinary per-second motion: a few
+      // ticks plus the finest wave amplitude headroom.
+      const headroom = BigInt(Math.round(def.basePaise * def.volBp * 7 / 1_000_000)) + 25n;
+      expect(jump, def.symbol).toBeLessThanOrEqual(headroom);
+    }
+  });
+
+  test("prices stay multiples of the tick and near their base", () => {
+    for (const def of SYMBOLS) {
+      for (let d = 0; d < 3; d += 1) {
+        const s = DAY0 + BigInt(d * 86_400) + 45_678n;
+        const p = pricePaise(def.symbol, s);
+        expect(p % BigInt(TICK_PAISE)).toBe(0n);
+        // Macro envelope: waves are bounded well inside ±10% of base.
+        const base = BigInt(def.basePaise);
+        expect(p).toBeGreaterThan(base * 9n / 10n);
+        expect(p).toBeLessThan(base * 11n / 10n);
+      }
+    }
+  });
+});
+
+describe("short-position state machine", () => {
+  const P = 100_000n; // ₹1000.00
+
+  test("FLAT + SELL opens a short with 2× margin", () => {
+    const r = applyTrade(null, { side: "SELL", qty: 10, pricePaise: P });
+    expect(r.kind).toBe("OPEN");
+    if (r.kind !== "OPEN") return;
+    expect(r.state.side).toBe("SHORT");
+    expect(r.state.qty).toBe(10);
+    expect(r.state.avgCostPaise).toBe(P);
+    expect(r.state.marginPaise).toBe(20n * P);
+  });
+
+  test("adding to a short raises margin and re-averages the entry", () => {
+    const o = applyTrade(null, { side: "SELL", qty: 10, pricePaise: P });
+    if (o.kind !== "OPEN") throw new Error("unreachable");
+    const a = applyTrade(o.state, { side: "SELL", qty: 10, pricePaise: 110_000n });
+    expect(a.kind).toBe("ADD");
+    if (a.kind !== "ADD") return;
+    expect(a.state.qty).toBe(20);
+    expect(a.state.avgCostPaise).toBe(105_000n);
+    expect(a.state.marginPaise).toBe(20n * P + 22n * 100_000n);
+  });
+
+  test("profitable cover releases margin and stores positive P&L", () => {
+    const o = applyTrade(null, { side: "SELL", qty: 10, pricePaise: P });
+    if (o.kind !== "OPEN") throw new Error("unreachable");
+    const c = applyTrade(o.state, { side: "BUY", qty: 10, pricePaise: 90_000n });
+    expect(c.kind).toBe("CLOSE");
+    if (c.kind !== "CLOSE") return;
+    expect(c.realizedPnlPaise).toBe(10n * 10_000n); // (1000 − 900) × 10
+    expect(c.marginReleasePaise).toBe(20n * P);
+  });
+
+  test("losing cover never exceeds half the margin at the 2× auto-cover", () => {
+    const o = applyTrade(null, { side: "SELL", qty: 10, pricePaise: P });
+    if (o.kind !== "OPEN") throw new Error("unreachable");
+    const c = applyTrade(o.state, {
+      side: "BUY",
+      qty: 10,
+      pricePaise: autoCoverStopPaise(P),
+    });
+    if (c.kind !== "CLOSE") throw new Error("expected CLOSE");
+    expect(c.realizedPnlPaise).toBe(-(10n * P)); // −1× notional = −½ margin
+    expect(c.marginReleasePaise).toBe(20n * P); // release ≥ payment
+  });
+
+  test("partial cover scales the margin release", () => {
+    const o = applyTrade(null, { side: "SELL", qty: 10, pricePaise: P });
+    if (o.kind !== "OPEN") throw new Error("unreachable");
+    const c = applyTrade(o.state, { side: "BUY", qty: 4, pricePaise: P });
+    expect(c.kind).toBe("PARTIAL_CLOSE");
+    if (c.kind !== "PARTIAL_CLOSE") return;
+    expect(c.state.qty).toBe(6);
+    expect(c.marginReleasePaise).toBe(8n * P); // 2×P×10 × 4/10
+    expect(c.realizedPnlPaise).toBe(0n);
+  });
+
+  test("no flip past zero in either direction", () => {
+    const o = applyTrade(null, { side: "SELL", qty: 5, pricePaise: P });
+    if (o.kind !== "OPEN") throw new Error("unreachable");
+    expect(applyTrade(o.state, { side: "BUY", qty: 6, pricePaise: P }).kind).toBe("BLOCK_FLIP");
+    const l = applyTrade(null, { side: "BUY", qty: 5, pricePaise: P });
+    if (l.kind !== "OPEN") throw new Error("unreachable");
+    expect(applyTrade(l.state, { side: "SELL", qty: 6, pricePaise: P }).kind).toBe("BLOCK_FLIP");
+  });
+
+  test("intent mirrors the server's state machine", () => {
+    expect(orderIntent(null, "SELL")).toBe("OPEN_SHORT");
+    expect(orderIntent(null, "BUY")).toBe("OPEN_LONG");
+    expect(orderIntent({ side: "SHORT", qty: 5 }, "BUY")).toBe("COVER_SHORT");
+    expect(orderIntent({ side: "SHORT", qty: 5 }, "SELL")).toBe("ADD_SHORT");
+    expect(orderIntent({ side: "LONG", qty: 5 }, "SELL")).toBe("EXIT_LONG");
+    expect(orderIntent({ side: "LONG", qty: 5 }, "BUY")).toBe("ADD_LONG");
+  });
+
+  test("solvency: release + cash always covers the worst-case payment", () => {
+    // For any short: margin = 2N. At the 2× stop, payment = 2N, release = N,
+    // so the trader's own cash funds at most N — exactly the max loss.
+    const qty = 37; // prime to catch floor-division drift
+    const o = applyTrade(null, { side: "SELL", qty, pricePaise: P });
+    if (o.kind !== "OPEN") throw new Error("unreachable");
+    const c = applyTrade(o.state, {
+      side: "BUY",
+      qty,
+      pricePaise: autoCoverStopPaise(P),
+    });
+    if (c.kind !== "CLOSE") throw new Error("expected CLOSE");
+    const payment = BigInt(qty) * autoCoverStopPaise(P);
+    // At the 2× stop: release (2N) funds the payment (2N) exactly, so the
+    // wallet dips only by the loss (N = ½ margin) — never negative.
+    expect(c.marginReleasePaise - payment).toBe(0n);
+    expect(c.realizedPnlPaise).toBe(-(BigInt(qty) * P));
   });
 });

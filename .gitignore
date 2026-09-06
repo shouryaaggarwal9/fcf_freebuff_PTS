@@ -2,5 +2,3 @@
 node_modules
 dist
 src/convex/_generated
-
-.vercel

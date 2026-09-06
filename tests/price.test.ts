@@ -11,8 +11,8 @@ import vectors from "./fixtures/price_vectors.json";
 
 interface Vector {
   symbol: string;
-  epoch: string;
-  price: string;
+  sec: number;
+  pricePaise: number;
 }
 
 const fixture = vectors as {
@@ -27,8 +27,8 @@ describe("golden vectors", () => {
 
   test("every vector reproduces exactly (deterministic past)", () => {
     for (const v of fixture.vectors) {
-      const actual = pricePaise(v.symbol, BigInt(v.epoch));
-      expect(actual.toString(), `${v.symbol}@${v.epoch}`).toBe(v.price);
+      const actual = pricePaise(v.symbol, BigInt(v.sec));
+      expect(actual.toString(), `${v.symbol}@${v.sec}`).toBe(String(v.pricePaise));
     }
   });
 

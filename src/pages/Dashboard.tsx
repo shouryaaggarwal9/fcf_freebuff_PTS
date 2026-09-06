@@ -15,7 +15,7 @@ import { useAuth } from "@/hooks/use-auth";
 import { useNowSec } from "@/hooks/use-now-sec";
 import { api } from "@/convex/_generated/api";
 import type { Doc, Id } from "@/convex/_generated/dataModel";
-import { SESSIONS, SYMBOLS } from "@/config/market";
+import { SYMBOLS } from "@/config/market";
 import {
   candleSeries,
   extendLiveSeries,
@@ -23,26 +23,20 @@ import {
 } from "@/engine/candles";
 import type { Candle } from "@/engine/model";
 import { dayStartSec, pricePaise } from "@/engine/price";
-import { errorMessage, formatINR, istTimeFull, istDayName, signedINR } from "@/lib/format";
+import { errorMessage, formatINR, istTimeFull, signedINR } from "@/lib/format";
+import { positionMtm } from "@/lib/position";
 import { cn } from "@/lib/utils";
-import { Brand } from "@/components/brand";
 import { CandleChart } from "@/components/trading/CandleChart";
+import { TradingShell } from "@/components/trading/TradingShell";
+import { DepthPanel } from "@/components/trading/DepthPanel";
 import { BooksPanel } from "@/components/trading/BooksPanel";
 import { OrderTicket, type TicketPrefill } from "@/components/trading/OrderTicket";
 import { Watchlist } from "@/components/trading/Watchlist";
 import { Button } from "@/components/ui/button";
 import { useMutation, useQuery } from "convex/react";
-import {
-  Activity,
-  Banknote,
-  CandlestickChart,
-  LogOut,
-  TimerReset,
-  TrendingUp,
-  Wallet,
-} from "lucide-react";
+import { Activity, Banknote, TrendingUp, Wallet } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { useNavigate } from "react-router";
+import { useSearchParams } from "react-router";
 import { toast } from "sonner";
 
 const DAY_SEC = 86_400;
@@ -60,8 +54,7 @@ function dayStartOfSec(sec: number): number {
 }
 
 export default function Dashboard() {
-  const { isAuthenticated, isLoading: authLoading, user, signOut } = useAuth();
-  const navigate = useNavigate();
+  const { isAuthenticated, isLoading: authLoading } = useAuth();
   const nowSec = useNowSec(1000);
 
   const account = useQuery(api.market.getAccount);
@@ -73,8 +66,30 @@ export default function Dashboard() {
   const registerAndFund = useMutation(api.market.registerAndFund);
   const reconcileUser = useMutation(api.market.reconcileUser);
 
-  const [activeSymbol, setActiveSymbol] = useState(SYMBOLS[0].symbol);
-  const [tfSec, setTfSec] = useState<TimeframeSec>(60);
+  // Chart state persists across refreshes and is shareable via URL params
+  // (?symbol=INFY&tf=300). Invalid params fall back to defaults. The effect
+  // below mirrors changes back into the URL with replace (no history spam).
+  const [searchParams, setSearchParams] = useSearchParams();
+  const urlSymbol = searchParams.get("symbol");
+  const urlTf = Number(searchParams.get("tf"));
+  const [activeSymbol, setActiveSymbol] = useState(
+    urlSymbol && SYMBOLS.some((d) => d.symbol === urlSymbol) ? urlSymbol : SYMBOLS[0].symbol,
+  );
+  const [tfSec, setTfSec] = useState<TimeframeSec>(
+    TIMEFRAMES.some((t) => t.sec === urlTf) ? (urlTf as TimeframeSec) : 60,
+  );
+
+  useEffect(() => {
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        next.set("symbol", activeSymbol);
+        next.set("tf", String(tfSec));
+        return next;
+      },
+      { replace: true },
+    );
+  }, [activeSymbol, tfSec, setSearchParams]);
   const [prefill, setPrefill] = useState<TicketPrefill | null>(null);
   const [fundError, setFundError] = useState<string | null>(null);
   const fundedRef = useRef(false);
@@ -114,7 +129,6 @@ export default function Dashboard() {
   /* ---------------------------- derived data ---------------------------- */
   const cash = account?.availableCashPaise ?? 0n;
   const todayStart = dayStartOfSec(nowSec);
-  const dayEndSec = dayStartOfSec(nowSec) + DAY_SEC;
 
   const holdingsBySymbol = useMemo(() => {
     const map = new Map<string, number>();
@@ -139,22 +153,17 @@ export default function Dashboard() {
     [positionRows],
   );
   const unrealized = useMemo(
-    () =>
-      positionRows.reduce(
-        (sum, p) => sum + (p.ltp - p.avgCostPaise) * BigInt(p.qty),
-        0n,
-      ),
+    () => positionRows.reduce((sum, p) => sum + positionMtm(p, p.ltp), 0n),
     [positionRows],
   );
   const realizedToday = useMemo(() => {
     let sum = 0n;
     for (const o of orders ?? []) {
-      if (
-        o.dayStartSec === todayStart &&
-        o.status === "FILLED" &&
-        o.side === "SELL"
-      ) {
-        sum += o.realizedPnlPaise ?? 0n;
+      if (o.dayStartSec === todayStart && o.status === "FILLED") {
+        // Exits (SELL on long) and covers (BUY on short) both carry realized P&L.
+        if ((o.side === "SELL" && o.intent !== "OPEN_SHORT") || (o.side === "BUY" && o.intent === "COVER_SHORT")) {
+          sum += o.realizedPnlPaise ?? 0n;
+        }
       }
     }
     return sum;
@@ -193,14 +202,6 @@ export default function Dashboard() {
   }, [activeSymbol, nowSec, tfSec]);
 
   /* ------------------------------ handlers ------------------------------ */
-  const handleSignOut = async () => {
-    try {
-      await signOut();
-    } finally {
-      navigate("/");
-    }
-  };
-
   const handlePlace = async (args: Parameters<typeof placeOrder>[0]) => {
     try {
       const res = await placeOrder(args);
@@ -253,85 +254,10 @@ export default function Dashboard() {
   const spotChange = spot - prevClose;
   const spotUp = spotChange >= 0n;
   const spotPct = prevClose === 0n ? 0n : (spotChange * 10_000n) / prevClose;
-  const equity = cash + holdingsValue;
   const dayPnl = realizedToday + unrealized;
-  const session = SESSIONS[0];
 
   return (
-    <div className="min-h-screen bg-background text-foreground">
-      <div className="lg:flex">
-        {/* ------------------------------ Sidebar ----------------------------- */}
-        <aside className="sticky top-0 hidden h-screen w-60 shrink-0 flex-col border-r border-border bg-sidebar text-sidebar-foreground lg:flex">
-          <button
-            type="button"
-            className="flex cursor-pointer items-center px-5 py-5"
-            onClick={() => navigate("/")}
-          >
-            <Brand />
-          </button>
-          <nav className="px-3">
-            <div className="flex items-center gap-2 rounded-lg bg-primary/10 px-3 py-2 text-[13px] font-semibold text-primary">
-              <CandlestickChart className="size-4" />
-              Terminal
-            </div>
-          </nav>
-          <div className="flex-1" />
-          <div className="mx-3 mb-3 rounded-lg border border-border/80 bg-muted/40 px-3 py-2.5">
-            <div className="flex items-center justify-between text-[10px] text-muted-foreground">
-              <span className="flex items-center gap-1.5 font-semibold tracking-wide uppercase">
-                <span className="size-1.5 animate-pulse rounded-full bg-up" />
-                {session.name}
-              </span>
-              <span className="tnum font-mono">{istTimeFull(nowSec * 1000)} IST</span>
-            </div>
-            <p className="mt-1 text-[10px] leading-4 text-muted-foreground">
-              {session.label} · day roll 05:30 IST (00:00 UTC)
-            </p>
-            <p className="tnum mt-1 font-mono text-[10px] text-gold">
-              {istDayName(nowSec * 1000)}
-            </p>
-          </div>
-          <div className="border-t border-border px-5 py-4">
-            <p className="truncate text-xs font-medium">
-              {user?.name ?? user?.email ?? "Trader"}
-            </p>
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              className="mt-2 h-8 w-full justify-start gap-2 px-0 text-muted-foreground hover:text-foreground"
-              onClick={handleSignOut}
-            >
-              <LogOut className="size-3.5" />
-              Sign out
-            </Button>
-          </div>
-        </aside>
-
-        {/* ------------------------------ Main ------------------------------ */}
-        <div className="min-w-0 flex-1">
-          {/* mobile top bar */}
-          <div className="sticky top-0 z-20 flex items-center justify-between border-b border-border bg-background/90 px-4 py-3 backdrop-blur lg:hidden">
-            <button type="button" onClick={() => navigate("/")} className="cursor-pointer">
-              <Brand />
-            </button>
-            <div className="flex items-center gap-2">
-              <span className="tnum rounded-md border border-border bg-muted px-2 py-1 font-mono text-[11px] font-semibold">
-                {formatINR(cash)}
-              </span>
-              <Button
-                type="button"
-                variant="outline"
-                size="icon"
-                className="size-8"
-                onClick={handleSignOut}
-              >
-                <LogOut className="size-4" />
-              </Button>
-            </div>
-          </div>
-
-          <div className="mx-auto w-full max-w-[1560px] px-4 py-4 sm:px-5 lg:px-6 lg:py-6">
+    <TradingShell active="terminal" cash={cash}>
             {/* account summary */}
             <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
               <StatCard
@@ -445,6 +371,34 @@ export default function Dashboard() {
                   nowSec={nowSec}
                   availableCashPaise={cash}
                   heldQty={holdingsBySymbol.get(activeSymbol) ?? 0}
+                  positionSide={
+                    (positionRows.find((p) => p.symbol === activeSymbol)?.side as
+                      | "LONG"
+                      | "SHORT"
+                      | undefined) ?? null
+                  }
+                  pendingBuyQty={
+                    (orders ?? [])
+                      .filter(
+                        (o) =>
+                          o.status === "OPEN" &&
+                          o.side === "BUY" &&
+                          o.symbol === activeSymbol &&
+                          !o.ocoId,
+                      )
+                      .reduce((n, o) => n + o.qty, 0)
+                  }
+                  pendingSellQty={
+                    (orders ?? [])
+                      .filter(
+                        (o) =>
+                          o.status === "OPEN" &&
+                          o.side === "SELL" &&
+                          o.symbol === activeSymbol &&
+                          !o.ocoId,
+                      )
+                      .reduce((n, o) => n + o.qty, 0)
+                  }
                   onPlace={handlePlace}
                   prefill={prefill}
                   className="min-h-[520px]"
@@ -464,18 +418,23 @@ export default function Dashboard() {
                   onSell={sellPosition}
                 />
               </section>
-              <section className="hidden min-h-0 overflow-hidden rounded-xl border border-border bg-card xl:flex xl:max-h-[560px] xl:flex-col">
-                <Watchlist
-                  nowSec={nowSec}
-                  activeSymbol={activeSymbol}
-                  onSelect={(s) => {
-                    setActiveSymbol(s);
-                    setPrefill(null);
-                  }}
-                  holdings={holdingsBySymbol}
-                  className="h-full"
-                />
-              </section>
+              <div className="hidden min-w-0 flex-col gap-4 xl:flex">
+                <section className="overflow-hidden rounded-xl border border-border bg-card">
+                  <DepthPanel symbol={activeSymbol} nowSec={nowSec} />
+                </section>
+                <section className="flex max-h-[480px] min-h-0 overflow-hidden rounded-xl border border-border bg-card">
+                  <Watchlist
+                    nowSec={nowSec}
+                    activeSymbol={activeSymbol}
+                    onSelect={(s) => {
+                      setActiveSymbol(s);
+                      setPrefill(null);
+                    }}
+                    holdings={holdingsBySymbol}
+                    className="h-full"
+                  />
+                </section>
+              </div>
             </div>
 
             {/* compact watchlist for smaller screens */}
@@ -487,22 +446,7 @@ export default function Dashboard() {
               />
             </div>
 
-            <footer className="mt-6 flex flex-wrap items-center justify-between gap-2 border-t border-border pt-4 text-[10px] text-muted-foreground">
-              <p>
-                <TimerReset className="mr-1 inline size-3" />
-                Deterministic synthetic market — price is a pure function of
-                (symbol, UTC second). Server-authoritative fills. Demo only; no
-                real money, no real market data.
-              </p>
-              <p className="tnum font-mono">
-                cash {formatINR(cash)} · equity {formatINR(equity)} · roll{" "}
-                {istTimeFull(dayEndSec * 1000)} IST
-              </p>
-            </footer>
-          </div>
-        </div>
-      </div>
-    </div>
+    </TradingShell>
   );
 }
 

@@ -21,6 +21,8 @@ import { ConvexError, v } from "convex/values";
 import { DAY_SECONDS, GRANT_PAISE, isSymbol } from "../config/market";
 import type { OrderTrigger } from "../engine/model";
 import { isMultipleOf } from "../engine/math";
+import { committedQty, ocoGroupId } from "../lib/oco";
+import type { OcoSellRef } from "../lib/oco";
 import {
   findFillTick,
   isMarketable,
@@ -33,6 +35,13 @@ import { internalMutation, mutation, query } from "./_generated/server";
 
 const DAY = BigInt(DAY_SECONDS);
 const MAX_QTY = 1_000_000;
+/**
+ * Overshoot headroom (paise/unit) for resting short entries: the price can
+ * overshoot a resting level by at most ~50p in one second (v2 wave caps),
+ * so reserving 2 × qty × 100p on top of the margin guarantees the first-tick
+ * fill's margin requirement never exceeds the blocked reserve.
+ */
+const SHORT_ENTRY_SLIP_PAISE = 100n;
 
 /* --------------------------------- errors -------------------------------- */
 
@@ -152,6 +161,11 @@ async function getPosition(
   );
 }
 
+/** Position side of a stored row (absent side = LONG, legacy rows). */
+function posSide(pos: Doc<"positions">): "LONG" | "SHORT" {
+  return pos.side === "SHORT" ? "SHORT" : "LONG";
+}
+
 async function upsertBuyPosition(
   ctx: import("./_generated/server").MutationCtx,
   userId: Id<"users">,
@@ -161,7 +175,20 @@ async function upsertBuyPosition(
   fillPricePaise: bigint,
   orderId: Id<"orders">,
   nowMs: number,
+  /** Existing SHORT row when this buy covers a short. */
+  shortPos?: Doc<"positions"> | null,
 ): Promise<Id<"positions">> {
+  if (shortPos) {
+    // Cover: reduce the short (delete at zero). Realized P&L and margin
+    // release are handled by the caller.
+    const remaining = shortPos.qty - qty;
+    if (remaining === 0) {
+      await ctx.db.delete(shortPos._id);
+    } else {
+      await ctx.db.patch(shortPos._id, { qty: remaining, updatedMs: nowMs });
+    }
+    return shortPos._id;
+  }
   const pos = await getPosition(ctx, userId, symbol, dayStartSec);
   if (!pos) {
     return ctx.db.insert("positions", {
@@ -169,6 +196,8 @@ async function upsertBuyPosition(
       symbol,
       dayStartSec,
       qty,
+      side: "LONG",
+      marginPaise: BigInt(qty) * fillPricePaise,
       avgCostPaise: fillPricePaise,
       openedOrderId: orderId,
       createdMs: nowMs,
@@ -180,6 +209,7 @@ async function upsertBuyPosition(
   await ctx.db.patch(pos._id, {
     qty: newQty,
     avgCostPaise: newAvg,
+    marginPaise: (pos.marginPaise ?? 0n) + BigInt(qty) * fillPricePaise,
     openedOrderId: pos.openedOrderId ?? orderId,
     updatedMs: nowMs,
   });
@@ -187,10 +217,17 @@ async function upsertBuyPosition(
 }
 
 /**
- * OCO-lite: after a SELL fill, cancel sibling OPEN sell orders on the same
- * (symbol, day) whose quantity would exceed remaining holdings. Newest-first
- * cancellation gives natural SL+target bracket behaviour: when one leg fills,
- * the other is cancelled in the same transaction.
+ * OCO-aware backstop: after a SELL fill, restore the invariant that resting
+ * sell commitments never exceed the remaining holding on (symbol, day).
+ *
+ * Cancels newest-first — lone sells AND OCO legs — recomputing committed
+ * quantity after each cancellation (removing one leg of a group changes the
+ * group's commit by min-leg semantics, not by that leg's qty). Every
+ * reachable over-commit shares one cause: the backing holding disappeared
+ * under resting exits (e.g. a manual market exit while a bracket rested), so
+ * the resting exits are the casualty, never the ledger. Cancelling all open
+ * sells always reaches committed 0 ≤ held, so this terminates in a
+ * consistent state without failing the surrounding transaction.
  */
 async function enforceSellAggregate(
   ctx: import("./_generated/server").MutationCtx,
@@ -200,26 +237,44 @@ async function enforceSellAggregate(
 ): Promise<void> {
   const pos = await getPosition(ctx, userId, symbol, dayStartSec);
   const held = pos?.qty ?? 0;
-  const siblings = await ctx.db
+  const rows = await ctx.db
     .query("orders")
     .withIndex("by_user_symbol_day", (q) =>
       q.eq("userId", userId).eq("symbol", symbol).eq("dayStartSec", dayStartSec),
     )
     .collect();
-  siblings.sort((a, b) => b.createdMs - a.createdMs);
-  let openQty = 0;
-  for (const s of siblings) openQty += s.qty;
-  let excess = openQty - held;
-  // cancel most recently created first while aggregate still exceeds holdings
-  for (const s of siblings) {
-    if (excess <= 0) break;
-    if (s.status === "OPEN" && s.side === "SELL") {
-      await ctx.db.patch(s._id, {
-        status: "CANCELLED",
-        version: s.version + 1,
-      });
-      excess -= s.qty;
+  rows.sort((a, b) => b.createdMs - a.createdMs);
+  for (;;) {
+    // Only long-exit sells are backed by the holding. Short-entry sells are
+    // margin-backed (their capacity lives in the margin check) and are never
+    // touched by this backstop.
+    const openSells = rows.filter(
+      (s) =>
+        s.status === "OPEN" &&
+        s.side === "SELL" &&
+        s.intent !== "OPEN_SHORT" &&
+        s.intent !== "ADD_SHORT",
+    );
+    if (
+      committedQty(
+        openSells.map((s) => ({
+          ocoId: s.ocoId ?? null,
+          qty: s.qty,
+          symbol,
+          dayStartSec,
+        })),
+      ) <= held
+    ) {
+      break;
     }
+    const victim = openSells[0];
+    if (!victim) break; // unreachable: an empty book always fits
+    await ctx.db.patch(victim._id, {
+      status: "CANCELLED",
+      version: victim.version + 1,
+    });
+    // Keep the local copy in sync so the loop re-counts correctly.
+    victim.status = "CANCELLED";
   }
 }
 
@@ -246,7 +301,14 @@ async function releaseReservation(
 
 /* ------------------------------ fills ------------------------------------- */
 
-/** Apply a BUY fill: position upsert, wallet cash, ledger, order record. */
+/**
+ * Apply a BUY fill. Two meanings by state:
+ *  - no position / LONG row: open or add to a long (cash out, position up).
+ *  - SHORT row: cover the short — release margin, pay for the buy-back,
+ *    store realized P&L (avg − fill) × qty on the order, reduce the short.
+ * A cover whose quantity exceeds the short is a stale order (state moved
+ * after validation); it is retired, never thrown on.
+ */
 async function applyBuyFill(
   ctx: import("./_generated/server").MutationCtx,
   wallet: Doc<"wallets">,
@@ -255,6 +317,83 @@ async function applyBuyFill(
   fillPricePaise: bigint,
   nowMs: number,
 ): Promise<void> {
+  const existing = await getPosition(ctx, order.userId, order.symbol, order.dayStartSec);
+  const isCover = existing !== null && posSide(existing) === "SHORT";
+
+  if (isCover) {
+    const pos = existing;
+    if (pos.qty < order.qty) {
+      // Stale cover (short already closed elsewhere). Retire, keep ledger.
+      await ctx.db.patch(order._id, {
+        status: "CANCELLED",
+        reason: "MANUAL",
+        version: order.version + 1,
+      });
+      return;
+    }
+    const q = BigInt(order.qty);
+    const avgCost = pos.avgCostPaise;
+    const payment = BigInt(order.qty) * fillPricePaise;
+    const release = (pos.marginPaise ?? 2n * avgCost * BigInt(pos.qty)) * q / BigInt(pos.qty);
+    // A reserve-less (market) cover must be payable out of current cash;
+    // resting covers carry their own reserve and release it below.
+    if (order.reservedCashPaise === 0n && payment > wallet.availableCashPaise) {
+      fail("Cover blocked: payment exceeds available cash (auto-cover stop protects you before 2× entry)");
+    }
+    if (order.reservedCashPaise > 0n) {
+      await moveCash(ctx, wallet, order.reservedCashPaise, "reserve_release", nowMs, order.dayStartSec, { orderId: order._id });
+    }
+    await moveCash(
+      ctx,
+      wallet,
+      release,
+      "margin_release",
+      nowMs,
+      order.dayStartSec,
+      { orderId: order._id, positionId: pos._id },
+    );
+    await moveCash(
+      ctx,
+      wallet,
+      -payment,
+      "cover_fill",
+      nowMs,
+      order.dayStartSec,
+      { orderId: order._id, positionId: pos._id },
+    );
+    await upsertBuyPosition(
+      ctx,
+      order.userId,
+      order.symbol,
+      order.dayStartSec,
+      order.qty,
+      fillPricePaise,
+      order._id,
+      nowMs,
+      pos,
+    );
+    await ctx.db.patch(order._id, {
+      status: "FILLED",
+      fillEpochSec: fillSec,
+      fillPricePaise,
+      filledMs: nowMs,
+      realizedPnlPaise: (avgCost - fillPricePaise) * q,
+      avgCostAtFillPaise: avgCost,
+      version: order.version + 1,
+    });
+    if (pos.qty - order.qty === 0) {
+      // Short fully closed: the auto-cover stop has nothing left to protect.
+      await cancelAutoCover(ctx, order.userId, order.symbol, order.dayStartSec, wallet, nowMs);
+    }
+    // Mirror of the sell side: a filled cover kills OCO siblings (e.g. the
+    // buy-stop leg of a short exit bracket).
+    if (order.ocoId) {
+      await cancelOcoSiblings(ctx, order.userId, order.ocoId, order._id);
+    }
+    return;
+  }
+
+  // Long entry / add-to-long (unchanged economics; margin tracked on row).
   const notional = BigInt(order.qty) * fillPricePaise;
   const reserved = order.reservedCashPaise;
   if (reserved > 0n) {
@@ -298,9 +437,38 @@ async function applyBuyFill(
 }
 
 /**
- * Apply a SELL fill: realized P&L stored on the order at fill time, cash +
- * proceeds, position reduction (delete at zero), then OCO-lite sibling
- * cancellation.
+ * OCO brackets: when one leg of a group fills, cancel every other OPEN leg
+ * of the same group in the same transaction. Idempotent — safe to call when
+ * the group has already been resolved (non-OPEN siblings are skipped).
+ */
+async function cancelOcoSiblings(
+  ctx: import("./_generated/server").MutationCtx,
+  userId: Id<"users">,
+  ocoId: string,
+  exceptOrderId: Id<"orders">,
+): Promise<void> {
+  const legs = await ctx.db
+    .query("orders")
+    .withIndex("by_oco", (q) => q.eq("userId", userId).eq("ocoId", ocoId))
+    .collect();
+  for (const leg of legs) {
+    if (leg._id === exceptOrderId) continue;
+    if (leg.status === "OPEN") {
+      await ctx.db.patch(leg._id, {
+        status: "CANCELLED",
+        version: leg.version + 1,
+      });
+    }
+  }
+}
+
+/**
+ * Apply a SELL fill, side-aware:
+ *  - LONG/FLAT row → exit long or OPEN SHORT (per intent). Long exits keep
+ *    the old economics; short entries release the blocked margin (reserve)
+ *    as `margin` and open/extend a SHORT position row whose margin equals
+ *    the settled entry margin (2 × fill notional).
+ *  - Unbacked quantity (stale pass) → the order is retired, never thrown.
  */
 async function applySellFill(
   ctx: import("./_generated/server").MutationCtx,
@@ -311,8 +479,76 @@ async function applySellFill(
   nowMs: number,
 ): Promise<void> {
   const pos = await getPosition(ctx, order.userId, order.symbol, order.dayStartSec);
-  if (!pos || pos.qty < order.qty) {
-    fail("sell exceeds held quantity (invariant violated)");
+  const isShortEntry = order.intent === "OPEN_SHORT" || order.intent === "ADD_SHORT";
+
+  if (isShortEntry) {
+    // Opening/extending a short: margin was reserved at placement (market
+    // entries) or is released from the reserve at fill (resting entries).
+    // Settled margin = 2 × fill notional. The reserve covers the worst case:
+    // 2 × level × qty + 2 × qty × SLIP ≥ 2 × (level ± 50p) × qty.
+    if (!pos || posSide(pos) !== "SHORT") {
+      if (pos) fail("short entry over an existing long position (invariant violated)");
+      // FLAT → open short. Release the reserve as margin.
+      if (order.reservedCashPaise > 0n) {
+        await moveCash(ctx, wallet, order.reservedCashPaise, "reserve_release", nowMs, order.dayStartSec, { orderId: order._id });
+      }
+      const margin = 2n * BigInt(order.qty) * fillPricePaise;
+      if (margin > wallet.availableCashPaise) {
+        // The overshoot headroom makes this unreachable; guard anyway.
+        fail("margin shortfall at short fill (overshoot headroom exceeded)");
+      }
+      await ctx.db.insert("positions", {
+        userId: order.userId,
+        symbol: order.symbol,
+        dayStartSec: order.dayStartSec,
+        qty: order.qty,
+        side: "SHORT",
+        marginPaise: margin,
+        avgCostPaise: fillPricePaise,
+        openedOrderId: order._id,
+        createdMs: nowMs,
+        updatedMs: nowMs,
+      });
+    } else {
+      // Extend the short: weighted average entry, margin += 2 × fill notional.
+      const q = BigInt(order.qty);
+      const newQty = pos.qty + order.qty;
+      const avg = (pos.avgCostPaise * BigInt(pos.qty) + fillPricePaise * q) / BigInt(newQty);
+      await ctx.db.patch(pos._id, {
+        qty: newQty,
+        avgCostPaise: avg,
+        marginPaise: (pos.marginPaise ?? 0n) + 2n * q * fillPricePaise,
+        updatedMs: nowMs,
+      });
+      if (order.reservedCashPaise > 0n) {
+        await moveCash(ctx, wallet, order.reservedCashPaise, "reserve_release", nowMs, order.dayStartSec, { orderId: order._id });
+      }
+    }
+    await ctx.db.patch(order._id, {
+      status: "FILLED",
+      fillEpochSec: fillSec,
+      fillPricePaise,
+      filledMs: nowMs,
+      version: order.version + 1,
+    });
+    if (order.ocoId) {
+      await cancelOcoSiblings(ctx, order.userId, order.ocoId, order._id);
+    }
+    return;
+  }
+
+  // Long exit.
+  if (!pos || posSide(pos) !== "LONG" || pos.qty < order.qty) {
+    // A fill for an unbacked quantity can only happen when state moved after
+    // this order was validated (e.g. a stale reconcile pass that predates a
+    // sibling's fill). The holding is the invariant; the stale order is the
+    // casualty: retire it instead of throwing and wedging reconciliation.
+    await ctx.db.patch(order._id, {
+      status: "CANCELLED",
+      reason: "MANUAL",
+      version: order.version + 1,
+    });
+    return;
   }
   const avgCost = pos.avgCostPaise;
   const proceeds = BigInt(order.qty) * fillPricePaise;
@@ -331,7 +567,11 @@ async function applySellFill(
   if (remaining === 0) {
     await ctx.db.delete(pos._id);
   } else {
-    await ctx.db.patch(pos._id, { qty: remaining, updatedMs: nowMs });
+    await ctx.db.patch(pos._id, {
+      qty: remaining,
+      marginPaise: (pos.marginPaise ?? BigInt(pos.qty) * avgCost) - (pos.marginPaise ?? BigInt(pos.qty) * avgCost) * BigInt(order.qty) / BigInt(pos.qty),
+      updatedMs: nowMs,
+    });
   }
   await ctx.db.patch(order._id, {
     status: "FILLED",
@@ -342,7 +582,98 @@ async function applySellFill(
     avgCostAtFillPaise: avgCost,
     version: order.version + 1,
   });
+  // OCO brackets: the other leg dies with this fill, releasing its share of
+  // the holding before the aggregate backstop re-checks capacity.
+  if (order.ocoId) {
+    await cancelOcoSiblings(ctx, order.userId, order.ocoId, order._id);
+  }
   await enforceSellAggregate(ctx, order.userId, order.symbol, order.dayStartSec);
+}
+
+/**
+ * Cancel the short's synthetic auto-cover stop (if any) and release its
+ * reserve. Called when the short is fully closed before the stop triggers.
+ */
+async function cancelAutoCover(
+  ctx: import("./_generated/server").MutationCtx,
+  userId: Id<"users">,
+  symbol: string,
+  dayStartSec: number,
+  wallet: Doc<"wallets">,
+  nowMs: number,
+): Promise<void> {
+  const auto = (
+    await ctx.db
+      .query("orders")
+      .withIndex("by_user_symbol_day", (q) =>
+        q.eq("userId", userId).eq("symbol", symbol).eq("dayStartSec", dayStartSec),
+      )
+      .collect()
+  ).find((o) => o.reason === "AUTO" && o.status === "OPEN");
+  if (!auto) return;
+  if (auto.reservedCashPaise > 0n) {
+    await moveCash(ctx, wallet, auto.reservedCashPaise, "reserve_release", nowMs, dayStartSec, { orderId: auto._id });
+  }
+  await ctx.db.patch(auto._id, {
+    status: "CANCELLED",
+    reason: "AUTO",
+    version: auto.version + 1,
+  });
+}
+
+/**
+ * Day-end force cover of a leftover SHORT at its day's last tick. Realized
+ * P&L = (avg − last) × qty; the margin release funds the payment (last tick
+ * is bounded well below 2× avg by the v2 wave envelope). Any resting cover
+ * orders and the AUTO stop are cancelled with their reserves released.
+ */
+async function forceCoverPosition(
+  ctx: import("./_generated/server").MutationCtx,
+  wallet: Doc<"wallets">,
+  pos: Doc<"positions">,
+  nowMs: number,
+): Promise<void> {
+  const lastTick = lastTickSecOfDay(BigInt(pos.dayStartSec));
+  const fp = pricePaise(pos.symbol, lastTick);
+  const payment = BigInt(pos.qty) * fp;
+  const realized = (pos.avgCostPaise - fp) * BigInt(pos.qty);
+  const release = pos.marginPaise ?? 2n * pos.avgCostPaise * BigInt(pos.qty);
+  if (payment > wallet.availableCashPaise + release) {
+    fail("day-end cover exceeds cash + margin (invariant violated)");
+  }
+  await moveCash(ctx, wallet, release, "margin_release", nowMs, pos.dayStartSec, { positionId: pos._id });
+  await moveCash(
+    ctx,
+    wallet,
+    -payment,
+    "cover_fill",
+    nowMs,
+    pos.dayStartSec,
+    { positionId: pos._id },
+  );
+  const orderId = await ctx.db.insert("orders", {
+    userId: pos.userId,
+    symbol: pos.symbol,
+    side: "BUY",
+    orderType: "MARKET",
+    status: "FILLED",
+    qty: pos.qty,
+    refPricePaise: fp,
+    reservedCashPaise: 0n,
+    dayStartSec: pos.dayStartSec,
+    createdMs: nowMs,
+    fillEpochSec: Number(lastTick),
+    fillPricePaise: fp,
+    filledMs: nowMs,
+    reason: "DAY_END",
+    intent: "COVER_SHORT",
+    realizedPnlPaise: realized,
+    avgCostAtFillPaise: pos.avgCostPaise,
+    version: 1,
+  });
+  void orderId;
+  await cancelAutoCover(ctx, pos.userId, pos.symbol, pos.dayStartSec, wallet, nowMs);
+  await ctx.db.delete(pos._id);
 }
 
 /** Day-end force sale of a leftover position at its day's last tick. */
@@ -414,6 +745,11 @@ export async function reconcileCore(
 
   for (const order of openOrders) {
     ordersChecked += 1;
+    // An earlier fill in this pass may have cancelled this order (OCO
+    // sibling or the aggregate backstop). The snapshot above is stale —
+    // trust the database: a cancelled order must never fill.
+    const fresh = await ctx.db.get(order._id);
+    if (!fresh || fresh.status !== "OPEN") continue;
     const dayEndSec = order.dayStartSec + DAY_SECONDS;
     const fromSec = firstEligibleTick(order.createdMs);
     const windowEnd = Math.min(nowSec, dayEndSec - 1);
@@ -433,7 +769,8 @@ export async function reconcileCore(
         continue;
       }
     }
-    // No trigger: expire orders whose trading day has fully ended.
+    // No trigger: expire orders whose trading day has fully ended. The
+    // re-fetch above guarantees the row is still OPEN here.
     if (nowSec >= dayEndSec && order.status === "OPEN") {
       if (order.reservedCashPaise > 0n) {
         await releaseReservation(ctx, wallet, order, nowMs);
@@ -446,16 +783,76 @@ export async function reconcileCore(
     }
   }
 
-  // Force-sell positions whose day has ended (intraday, every day starts flat).
-  const dayEndedPositions = await ctx.db
+  // Auto-cover stops: every SHORT position always has exactly one synthetic
+  // STOP buy at 2 × avg entry (reason AUTO). Kept in lockstep here — created
+  // when missing, re-pinned when the avg moves (adds), cancelled when the
+  // short is gone. It is the solvency guarantee: max loss = ½ margin.
+  const allPositions = await ctx.db
     .query("positions")
     .withIndex("by_user_day", (q) => q.eq("userId", userId))
     .collect();
-  for (const pos of dayEndedPositions) {
-    if (pos.dayStartSec + DAY_SECONDS <= nowSec) {
-      await forceSellPosition(ctx, wallet, pos, nowMs);
-      positionsClosed += 1;
+  for (const pos of allPositions) {
+    if (pos.dayStartSec + DAY_SECONDS <= nowSec) continue; // settled below
+    if (posSide(pos) !== "SHORT" || pos.qty === 0) continue;
+    const stopLevel = 2n * pos.avgCostPaise;
+    const existingAuto = (
+      await ctx.db
+        .query("orders")
+        .withIndex("by_user_symbol_day", (q) =>
+          q.eq("userId", userId).eq("symbol", pos.symbol).eq("dayStartSec", pos.dayStartSec),
+        )
+        .collect()
+    ).find((o) => o.reason === "AUTO" && o.status === "OPEN");
+    if (!existingAuto) {
+      // Margin + headroom reserve: the fill pays ≤ level (guaranteed stop),
+      // the release funds it — reserve is a self-funded safety net.
+      const reserve = 2n * BigInt(pos.qty) * stopLevel + 2n * BigInt(pos.qty) * SHORT_ENTRY_SLIP_PAISE;
+      if (reserve > wallet.availableCashPaise) continue; // cannot post reserve (see note below)
+      await moveCash(ctx, wallet, -reserve, "reserve", nowMs, pos.dayStartSec, {});
+      await ctx.db.insert("orders", {
+        userId,
+        symbol: pos.symbol,
+        side: "BUY",
+        orderType: "STOP",
+        status: "OPEN",
+        qty: pos.qty,
+        stopPaise: stopLevel,
+        refPricePaise: stopLevel,
+        reservedCashPaise: reserve,
+        dayStartSec: pos.dayStartSec,
+        createdMs: nowMs,
+        reason: "AUTO",
+        intent: "COVER_SHORT",
+        version: 1,
+      });
+    } else if (existingAuto.stopPaise !== stopLevel || existingAuto.qty !== pos.qty) {
+      const oldReserve = existingAuto.reservedCashPaise;
+      const reserve = 2n * BigInt(pos.qty) * stopLevel + 2n * BigInt(pos.qty) * SHORT_ENTRY_SLIP_PAISE;
+      const delta = reserve - oldReserve;
+      if (delta > 0n && delta > wallet.availableCashPaise) continue;
+      if (delta !== 0n) {
+        await moveCash(ctx, wallet, -delta, delta > 0n ? "reserve" : "reserve_release", nowMs, pos.dayStartSec, { orderId: existingAuto._id });
+      }
+      await ctx.db.patch(existingAuto._id, {
+        qty: pos.qty,
+        stopPaise: stopLevel,
+        refPricePaise: stopLevel,
+        reservedCashPaise: reserve,
+        version: existingAuto.version + 1,
+      });
     }
+  }
+
+  // Force-square positions whose day has ended (intraday, every day starts
+  // flat): longs sell at the last tick, shorts cover at the last tick.
+  for (const pos of allPositions) {
+    if (pos.dayStartSec + DAY_SECONDS > nowSec) continue;
+    if (posSide(pos) === "SHORT") {
+      await forceCoverPosition(ctx, wallet, pos, nowMs);
+    } else {
+      await forceSellPosition(ctx, wallet, pos, nowMs);
+    }
+    positionsClosed += 1;
   }
 
   return { ordersChecked, positionsClosed };
@@ -505,28 +902,60 @@ function validateLevel(label: string, value?: bigint): bigint {
   return value;
 }
 
+/**
+ * Sell capacity, OCO-aware: a bracket group (shared ocoId) commits only its
+ * minimum leg quantity because at most one leg can fill — the engine cancels
+ * the survivors the moment one leg fills. Lone sells commit their full qty.
+ * The `override` re-counts an existing order at a new qty (edit path, whose
+ * bracket was dissolved before this check runs).
+ */
 async function validateSellCapacity(
   ctx: import("./_generated/server").MutationCtx,
   userId: Id<"users">,
   symbol: string,
   dayStartSec: number,
   extraQty: number,
+  override?: { orderId: Id<"orders">; qty: number },
 ): Promise<void> {
   const pos = await getPosition(ctx, userId, symbol, dayStartSec);
   const held = pos?.qty ?? 0;
-  const openSells = (await ctx.db
+  const all = (await ctx.db
     .query("orders")
     .withIndex("by_user_symbol_day", (q) =>
       q.eq("userId", userId).eq("symbol", symbol).eq("dayStartSec", dayStartSec),
     )
     .collect()).filter((s) => s.status === "OPEN" && s.side === "SELL");
-  let openSellQty = 0;
-  for (const s of openSells) openSellQty += s.qty;
-  if (openSellQty + extraQty > held) {
+  const refs: OcoSellRef[] = all
+    .filter((s) => !override || s._id !== override.orderId)
+    .map((s) => ({ ocoId: s.ocoId ?? null, qty: s.qty, symbol, dayStartSec }));
+  if (override && override.qty > 0) {
+    refs.push({ ocoId: null, qty: override.qty, symbol, dayStartSec });
+  }
+  const committed = committedQty(refs);
+  if (committed + (override ? 0 : extraQty) > held) {
     fail(
-      `Sell blocked: open sells ${openSellQty} + ${extraQty} exceed held ${held} on ${symbol} for today`,
+      `Sell blocked: committed ${committed} + ${extraQty} exceed held ${held} on ${symbol} for today`,
     );
   }
+}
+
+/**
+ * Persist OCO membership: given the first inserted leg and the pending
+ * second leg (now validated), stamp a server-minted ocoId on the first and
+ * return it for the second's insert.
+ */
+async function linkOcoSibling(
+  ctx: import("./_generated/server").MutationCtx,
+  userId: Id<"users">,
+  firstLeg: Doc<"orders">,
+  createdMs: number,
+): Promise<string> {
+  const id = ocoGroupId(userId, firstLeg.symbol, firstLeg.dayStartSec, createdMs);
+  await ctx.db.patch(firstLeg._id, {
+    ocoId: id,
+    version: firstLeg.version + 1,
+  });
+  return id;
 }
 
 /**
@@ -587,9 +1016,135 @@ export const placeOrder = mutation({
           : spot;
     const fillNow = args.orderType === "MARKET" || marketable;
     const fillPrice = spot; // marketable fills happen at the current spot
-    const reserved = fillNow ? 0n : BigInt(args.qty) * refPrice;
 
-    if (args.side === "BUY") {
+    /* ----------------- state machine: what does this order mean? -------------
+     * FLAT  + SELL = short entry (margin 2 × notional)
+     * FLAT  + BUY  = long entry (cash check)
+     * LONG  + SELL = exit long  (holdings capacity, OCO-aware)
+     * LONG  + BUY  = add to long (cash check)
+     * SHORT + BUY  = cover short (qty ≤ short, cover capacity, OCO-aware)
+     * SHORT + SELL = add to short (margin check)
+     * No auto-flip: crossing zero is rejected in every branch.
+     */
+    const existingPos = await getPosition(ctx, userId, args.symbol, dayStart);
+    const state: "FLAT" | "LONG" | "SHORT" =
+      existingPos === null ? "FLAT" : posSide(existingPos);
+
+    // OCO pairing: any second UNLINKED resting order on the same
+    // (symbol, day, side) becomes this order's bracket sibling — exit
+    // brackets (SL+target), cover brackets, and entry brackets all reuse it.
+    // The first leg to fill cancels the other in the same transaction.
+    let pendingSibling: Doc<"orders"> | null = null;
+    if (!fillNow) {
+      const candidates = (await ctx.db
+        .query("orders")
+        .withIndex("by_user_symbol_day", (q) =>
+          q.eq("userId", userId).eq("symbol", args.symbol).eq("dayStartSec", dayStart),
+        )
+        .collect())
+        .filter(
+          (o) =>
+            o.status === "OPEN" &&
+            o.side === args.side &&
+            o.reason !== "AUTO" &&
+            o.createdMs < nowMs &&
+            !o.ocoId,
+        )
+        .sort((a, b) => b.createdMs - a.createdMs);
+      pendingSibling = candidates[0] ?? null;
+    }
+
+    /** Pairing-aware commitment of same-side resting orders + this one. */
+    const committedWith = (rows: Doc<"orders">[], qty: number): number => {
+      if (pendingSibling) {
+        const rest = rows
+          .filter((s) => s._id !== pendingSibling._id)
+          .map((s) => ({ ocoId: s.ocoId ?? null, qty: s.qty, symbol: args.symbol, dayStartSec: dayStart }));
+        return committedQty(rest) + Math.min(pendingSibling.qty, qty);
+      }
+      return (
+        committedQty(
+          rows.map((s) => ({ ocoId: s.ocoId ?? null, qty: s.qty, symbol: args.symbol, dayStartSec: dayStart })),
+        ) + qty
+      );
+    };
+
+    // Default reserve: the standard cash reserve for BUY orders and cover
+    // fills at-or-better than the level. Overridden for short entries below.
+    let reserved = fillNow ? 0n : BigInt(args.qty) * refPrice;
+
+    if (args.side === "SELL" && state === "LONG") {
+      // Exit long: resting sells must fit under the holding (pairing-aware;
+      // a bracket group commits min(sibling, this), so SL+target share one
+      // slot). Marketable exits fill at spot right away.
+      if (fillNow) {
+        await validateSellCapacity(ctx, userId, args.symbol, dayStart, args.qty);
+      } else {
+        const openSells = (await ctx.db
+          .query("orders")
+          .withIndex("by_user_symbol_day", (q) =>
+            q.eq("userId", userId).eq("symbol", args.symbol).eq("dayStartSec", dayStart),
+          )
+          .collect()).filter((s) => s.status === "OPEN" && s.side === "SELL");
+        const committed = committedWith(openSells, args.qty);
+        const held = existingPos?.qty ?? 0;
+        if (committed > held) {
+          fail(
+            `Sell blocked: committed ${committed} would exceed held ${held} on ${args.symbol} for today`,
+          );
+        }
+      }
+    } else if (args.side === "SELL") {
+      // Short entry (FLAT) or add-to-short (SHORT). Margin = 2 × notional.
+      // Resting entries additionally reserve a one-tick overshoot headroom
+      // (2 × qty × 100p) so the first-tick fill (price can overshoot the
+      // level by at most ~50p in one second) can never overdraw the wallet:
+      // reserve released ≥ margin blocked at fill, always.
+      const notional = BigInt(args.qty) * refPrice;
+      const margin = 2n * notional;
+      reserved = fillNow ? margin : margin + 2n * BigInt(args.qty) * SHORT_ENTRY_SLIP_PAISE;
+      if (reserved > wallet.availableCashPaise) {
+        fail(
+          `Insufficient margin: shorting ${args.qty} ${args.symbol} blocks ₹${(reserved / 100n).toString()} (2× notional${fillNow ? "" : " + overshoot headroom"})`,
+        );
+      }
+    } else if (args.side === "BUY" && state === "SHORT" && existingPos) {
+      // Cover: no flip past the short, capacity mirror of the sell side.
+      if (args.qty > existingPos.qty) {
+        fail(
+          `Cover blocked: short is ${existingPos.qty} ${args.symbol} — buying more would flip the position (not allowed)`,
+        );
+      }
+      const openBuys = (await ctx.db
+        .query("orders")
+        .withIndex("by_user_symbol_day", (q) =>
+          q.eq("userId", userId).eq("symbol", args.symbol).eq("dayStartSec", dayStart),
+        )
+        .collect()).filter(
+          (s) => s.status === "OPEN" && s.side === "BUY" && s.reason !== "AUTO",
+        );
+      const committed = committedWith(openBuys, args.qty);
+      if (committed > existingPos.qty) {
+        fail(
+          `Cover blocked: committed covers ${committed} would exceed the ${existingPos.qty} short on ${args.symbol} for today`,
+        );
+      }
+      if (fillNow) {
+        // Market cover: payment at spot must fit current cash (the margin
+        // release arrives in the same transaction and funds the rest).
+        const payment = BigInt(args.qty) * fillPrice;
+        const release =
+          (existingPos.marginPaise ?? 0n) * BigInt(args.qty) / BigInt(existingPos.qty);
+        if (payment > wallet.availableCashPaise + release) {
+          fail("Insufficient cash for the cover payment");
+        }
+      } else if (reserved > wallet.availableCashPaise) {
+        fail(
+          `Insufficient cash: need ₹${(reserved / 100n).toString()} for the ${args.qty} qty cover reservation`,
+        );
+      }
+    } else {
+      // Long entry / add-to-long: unchanged cash checks.
       if (fillNow) {
         const notional = BigInt(args.qty) * fillPrice;
         if (notional > wallet.availableCashPaise) {
@@ -602,11 +1157,14 @@ export const placeOrder = mutation({
           );
         }
       }
-    } else if (!fillNow) {
-      // Marketable sells (spot already at/through the level) fill at spot
-      // right away; only resting sells need the held-quantity check.
-      await validateSellCapacity(ctx, userId, args.symbol, dayStart, args.qty);
     }
+
+    // What this order means given the position state — used by the aggregate
+    // backstop and the UI to tell long-exit sells from short-entry sells.
+    const intent =
+      args.side === "BUY"
+        ? state === "SHORT" ? "COVER_SHORT" : state === "LONG" ? "ADD_LONG" : "OPEN_LONG"
+        : state === "SHORT" ? "ADD_SHORT" : state === "LONG" ? "EXIT_LONG" : "OPEN_SHORT";
 
     const orderId = await ctx.db.insert("orders", {
       userId,
@@ -622,11 +1180,20 @@ export const placeOrder = mutation({
       dayStartSec: dayStart,
       createdMs: nowMs,
       reason: "MANUAL",
+      intent,
       version: 1,
     });
 
-    // Reservation (resting BUY only): cash reserved, ledger pair entry.
-    if (!fillNow && args.side === "BUY") {
+    // Pair the bracket after all validation passed: stamp both legs with a
+    // server-minted group id so they share one slot of the holding.
+    if (pendingSibling) {
+      const gid = await linkOcoSibling(ctx, userId, pendingSibling, nowMs);
+      await ctx.db.patch(orderId, { ocoId: gid, version: 2 });
+    }
+
+    // Reservation (resting orders that block cash): BUY orders reserve their
+    // level-based cash; resting short entries reserve 2× notional + headroom.
+    if (!fillNow && reserved > 0n) {
       await moveCash(
         ctx,
         wallet,
@@ -674,6 +1241,9 @@ export const cancelOrder = mutation({
 
     const order = await ctx.db.get(args.orderId);
     if (!order || order.userId !== userId) fail("Order not found");
+    if (order.reason === "AUTO") {
+      fail("The auto-cover stop protects your short and cannot be cancelled — cover the short to remove it");
+    }
     if (order.status !== "OPEN") {
       return {
         status: order.status as string,
@@ -690,6 +1260,15 @@ export const cancelOrder = mutation({
       status: "CANCELLED",
       version: order.version + 1,
     });
+    // Cancelling one OCO leg tears down the whole bracket: the surviving leg
+    // alone is no longer the exit strategy the trader asked for.
+    if (order.ocoId) {
+      await cancelOcoSiblings(ctx, userId, order.ocoId, order._id);
+      return {
+        status: "CANCELLED",
+        message: "Order cancelled — OCO bracket leg cancelled with it",
+      };
+    }
     return { status: "CANCELLED", message: "Order cancelled" };
   },
 });
@@ -711,6 +1290,9 @@ export const editOrder = mutation({
 
     const order = await ctx.db.get(args.orderId);
     if (!order || order.userId !== userId) fail("Order not found");
+    if (order.reason === "AUTO") {
+      fail("The auto-cover stop is managed by the engine and cannot be edited");
+    }
     if (order.status !== "OPEN") {
       fail(`Cannot edit a ${order.status.toLowerCase()} order`);
     }
@@ -782,8 +1364,17 @@ export const editOrder = mutation({
       return { status: "FILLED", message: "Edited order was due — filled at spot" };
     }
 
+    // Editing an OCO leg breaks the bracket — the sibling is cancelled and
+    // this order becomes a lone sell, so capacity is re-checked WITHOUT the
+    // OCO group discount (with the sibling removed via the override).
+    if (order.ocoId) {
+      await cancelOcoSiblings(ctx, userId, order.ocoId, order._id);
+    }
     if (order.side === "SELL") {
-      await validateSellCapacity(ctx, userId, order.symbol, dayStart, qty);
+      await validateSellCapacity(ctx, userId, order.symbol, dayStart, qty, {
+        orderId: order._id,
+        qty,
+      });
     }
 
     // Mutate with re-run reservation (BUY cash reserve re-balanced).
@@ -819,9 +1410,17 @@ export const editOrder = mutation({
       ...(limit !== null ? { limitPaise: limit } : {}),
       ...(stop !== null ? { stopPaise: stop } : {}),
       reservedCashPaise: newReserved,
+      // The bracket was dissolved above — clear the stale group id so this
+      // order counts (and can pair again) as a lone sell.
+      ...(order.ocoId ? { ocoId: undefined } : {}),
       version: order.version + 1,
     });
-    return { status: "OPEN", message: "Order updated" };
+    return {
+      status: "OPEN",
+      message: order.ocoId
+        ? "Order updated — OCO bracket dissolved, sibling cancelled"
+        : "Order updated",
+    };
   },
 });
 
@@ -914,7 +1513,9 @@ export const getLedger = query({
       .withIndex("by_user_time", (q) => q.eq("userId", userId))
       .order("asc")
       .collect();
-    let running = GRANT_PAISE;
+    // Running balance starts at 0: the ₹10L grant is itself the first ledger
+    // row (deposit), so seeding the sum with GRANT_PAISE double-counted it.
+    let running = 0n;
     const out: Array<
       Doc<"ledger"> & { runningBalancePaise: bigint }
     > = [];
@@ -942,11 +1543,12 @@ export const getDaySummary = query({
     let sells = 0;
     let buys = 0;
     for (const o of todayOrders) {
-      if (o.status === "FILLED" && o.side === "SELL") {
+      if (o.status === "FILLED") {
+        // Realized P&L lives on long-exit SELL fills AND short-cover BUY
+        // fills (both store it at fill time).
         realizedPaise += o.realizedPnlPaise ?? 0n;
-        sells += 1;
-      } else if (o.status === "FILLED" && o.side === "BUY") {
-        buys += 1;
+        if (o.side === "SELL") sells += 1;
+        else buys += 1;
       }
     }
     return {
@@ -955,6 +1557,201 @@ export const getDaySummary = query({
       sells,
       buys,
       openOrders: todayOrders.filter((o) => o.status === "OPEN").length,
+    };
+  },
+});
+
+/* ------------------------------- analytics -------------------------------- */
+
+/**
+ * 6. get_analytics() — automated trade analytics over the ledger and stored
+ * realized P&L. Money aggregates are integer paise; only statistical RATIOS
+ * (Sharpe) use float math, and never on a money value itself. Equity curve:
+ * the ledger running balance at each UTC day end — correct because the
+ * intraday model force-sells everything by day end, so closing cash equals
+ * closing equity. Today's entry is live: cash + open positions at LTP.
+ */
+export const getAnalytics = query({
+  args: {},
+  handler: async (ctx) => {
+    const userId = await getAuthUserId(ctx);
+    if (userId === null) return null;
+    const nowMs = Date.now();
+    const today = dayStartOfMs(nowMs);
+
+    const wallet = await ctx.db
+      .query("wallets")
+      .withIndex("by_user", (q) => q.eq("userId", userId))
+      .first();
+    const cash = wallet?.availableCashPaise ?? 0n;
+
+    /* --------------------- daily equity from the ledger --------------------- */
+    const ledger = await ctx.db
+      .query("ledger")
+      .withIndex("by_user_time", (q) => q.eq("userId", userId))
+      .order("asc")
+      .collect();
+
+    const days: { dayStartSec: number; equityPaise: bigint }[] = [];
+    let running = 0n; // start at 0: the grant is itself the first ledger row
+    let prevDay: number | null = null;
+    let dayEndBalance = 0n;
+    for (const row of ledger) {
+      running += row.amountPaise;
+      if (prevDay !== null && row.dayStartSec !== prevDay) {
+        days.push({ dayStartSec: prevDay, equityPaise: dayEndBalance });
+      }
+      prevDay = row.dayStartSec;
+      dayEndBalance = running;
+    }
+
+    // Live MTM for open positions (display-only float-free: qty × LTP).
+    const openPositions = await ctx.db
+      .query("positions")
+      .withIndex("by_user_day", (q) => q.eq("userId", userId))
+      .collect();
+    let holdingsValue = 0n;
+    for (const p of openPositions) {
+      if (p.dayStartSec !== today) continue;
+      const ltp = pricePaise(p.symbol, BigInt(Math.floor(nowMs / 1000)));
+      // LONG adds the asset value; SHORT adds margin minus the buy-back
+      // liability (margin is blocked cash, so it counts toward equity).
+      holdingsValue +=
+        p.side === "SHORT"
+          ? (p.marginPaise ?? 2n * p.avgCostPaise * BigInt(p.qty)) -
+            BigInt(p.qty) * ltp
+          : BigInt(p.qty) * ltp;
+    }
+    const currentEquity = cash + holdingsValue;
+
+    // Today's live equity replaces/extends the ledger-derived tail.
+    if (prevDay !== null && prevDay === today) {
+      days[days.length - 1] = { dayStartSec: today, equityPaise: currentEquity };
+    } else {
+      days.push({ dayStartSec: today, equityPaise: currentEquity });
+    }
+
+    const start = GRANT_PAISE; // literal nonzero constant — no zero guard needed
+    const totalReturnBp = ((currentEquity - start) * 10_000n) / start;
+
+    // Max drawdown in basis points of the running peak — integer arithmetic.
+    let peak = start;
+    let maxDrawdownBp = 0n;
+    for (const d of days) {
+      if (d.equityPaise > peak) peak = d.equityPaise;
+      if (peak > 0n) {
+        const dd = ((peak - d.equityPaise) * 10_000n) / peak;
+        if (dd > maxDrawdownBp) maxDrawdownBp = dd;
+      }
+    }
+
+    // Daily returns for Sharpe (float allowed: statistic, not money).
+    const rets: number[] = [];
+    for (let i = 1; i < days.length; i++) {
+      const prev = days[i - 1].equityPaise;
+      if (prev > 0n) rets.push(Number(days[i].equityPaise - prev) / Number(prev));
+    }
+    let sharpe: number | null = null;
+    if (rets.length >= 2) {
+      const mean = rets.reduce((a, b) => a + b, 0) / rets.length;
+      const variance =
+        rets.reduce((a, b) => a + (b - mean) * (b - mean), 0) /
+        (rets.length - 1);
+      const sd = Math.sqrt(variance);
+      if (sd > 1e-12) {
+        sharpe = (mean / sd) * Math.sqrt(252); // annualized, daily returns
+      }
+    }
+
+    // Day P&L extremes from the equity series.
+    let bestDay = 0n;
+    let worstDay = 0n;
+    for (let i = 1; i < days.length; i++) {
+      const delta = days[i].equityPaise - days[i - 1].equityPaise;
+      if (delta > bestDay) bestDay = delta;
+      if (delta < worstDay) worstDay = delta;
+    }
+
+    /* -------------- round trips from stored realized P&L (SELLs) ------------ */
+    const filledSells = await ctx.db
+      .query("orders")
+      .withIndex("by_user_status", (q) =>
+        q.eq("userId", userId).eq("status", "FILLED"),
+      )
+      .collect();
+
+    // One round trip per (symbol, day): partial exits aggregate into it.
+    const trips = new Map<
+      string,
+      { symbol: string; dayStartSec: number; qty: number; pnlPaise: bigint }
+    >();
+    for (const o of filledSells) {
+      if (o.side !== "SELL") continue;
+      const key = `${o.symbol}:${o.dayStartSec}`;
+      const cur = trips.get(key);
+      if (cur) {
+        cur.qty += o.qty;
+        cur.pnlPaise += o.realizedPnlPaise ?? 0n;
+      } else {
+        trips.set(key, {
+          symbol: o.symbol,
+          dayStartSec: o.dayStartSec,
+          qty: o.qty,
+          pnlPaise: o.realizedPnlPaise ?? 0n,
+        });
+      }
+    }
+    const tradeList = [...trips.values()].sort(
+      (a, b) => b.dayStartSec - a.dayStartSec,
+    );
+
+    let wins = 0;
+    let losses = 0;
+    let flats = 0;
+    let grossProfit = 0n;
+    let grossLoss = 0n;
+    let largestWin = 0n;
+    let largestLoss = 0n;
+    for (const t of tradeList) {
+      if (t.pnlPaise > 0n) {
+        wins += 1;
+        grossProfit += t.pnlPaise;
+        if (t.pnlPaise > largestWin) largestWin = t.pnlPaise;
+      } else if (t.pnlPaise < 0n) {
+        losses += 1;
+        grossLoss += -t.pnlPaise;
+        if (-t.pnlPaise > largestLoss) largestLoss = -t.pnlPaise;
+      } else {
+        flats += 1;
+      }
+    }
+    const closed = wins + losses + flats;
+    const winRateBp = closed === 0 ? 0n : (BigInt(wins) * 10_000n) / BigInt(closed);
+    const avgWin = wins === 0 ? 0n : grossProfit / BigInt(wins);
+    const avgLoss = losses === 0 ? 0n : grossLoss / BigInt(losses);
+
+    return {
+      grantPaise: start,
+      currentEquityPaise: currentEquity,
+      totalReturnPctBp: totalReturnBp,
+      maxDrawdownPctBp: maxDrawdownBp,
+      sharpe,
+      days,
+      nDays: days.length,
+      bestDayPaise: bestDay,
+      worstDayPaise: worstDay,
+      trades: tradeList,
+      nTrades: closed,
+      wins,
+      losses,
+      flats,
+      winRatePctBp: winRateBp,
+      grossProfitPaise: grossProfit,
+      grossLossPaise: grossLoss,
+      avgWinPaise: avgWin,
+      avgLossPaise: avgLoss,
+      largestWinPaise: largestWin,
+      largestLossPaise: largestLoss,
     };
   },
 });

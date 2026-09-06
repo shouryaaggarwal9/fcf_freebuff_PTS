@@ -8,17 +8,17 @@
  * price(symbol, epochSec) -> integer paise, multiple of TICK_PAISE
  *
  *   Let base = symbol.basePaise. Define an "anchor function" F over the
- *   60-second grid (grid point g is a multiple of 60 s):
+ *   10-second grid (grid point g is a multiple of 10 s):
  *
  *     F(g) = base + Σ_waves coarseWave_w(g)
  *
- *   Each coarse wave w has spacing A_w ∈ {86400, 21600, 3600, 600} seconds
- *   and half-range amplitude amp_w (integer paise, frozen per symbol:
- *   amp_w = floor(base·volBp·waveBp_w / 1_000_000)). Anchor k of wave w sits
- *   at second k·A_w; its level level_w(k) is a bounded 64-bit splitmix64 hash
- *   of (symbol seed, wave id, k) mapped into the closed interval
- *   [-amp_w, +amp_w]. Between anchors the wave is a straight integer line
- *   evaluated at any second s:
+ *   Each coarse wave w has spacing A_w ∈ {86400, 21600, 3600, 900, 300, 60,
+ *   10} seconds and half-range amplitude amp_w (integer paise, frozen per
+ *   symbol: amp_w = floor(base·volBp·waveBp_w / 1_000_000)). Anchor k of
+ *   wave w sits at second k·A_w; its level level_w(k) is a bounded 64-bit
+ *   splitmix64 hash of (symbol seed, wave id, k) mapped into the closed
+ *   interval [-amp_w, +amp_w]. Between anchors the wave is a straight
+ *   integer line evaluated at any second s:
  *
  *     coarseWave_w(s) = level_w(k) + floor((level_w(k+1)-level_w(k))·t / A_w)
  *     with k = floor(s/A_w), t = s - k·A_w
@@ -27,22 +27,30 @@
  *   (level(D+1)-level(D))/day derives from (symbol, UTC date) anchor levels
  *   and changes at the 00:00 UTC boundary while the level stays continuous.
  *
- *   The market price at an arbitrary second s ∈ [g, g+60) with g a grid point
+ *   The market price at an arbitrary second s ∈ [g, g+10) with g a grid point
  *   is then the linear integer interpolation between the two neighboring
  *   anchor values:
  *
- *     price_raw(s) = F(g) + floor((F(g+60) - F(g))·(s-g) / 60)
+ *     price_raw(s) = F(g) + floor((F(g+10) - F(g))·(s-g) / 10)
  *     price(s)     = floor(price_raw(s) / TICK_PAISE) · TICK_PAISE
  *
  *   Why this structure: every coarse wave is continuous and every 00:00 UTC
  *   boundary is a grid point, so price is continuous across days. Inside a
- *   60 s segment no wave has an interior anchor and the interpolation is
+ *   10 s segment no wave has an interior anchor and the interpolation is
  *   linear, hence price — and any monotone trigger predicate on it — is
- *   monotone there. The first-crossing oracle walks 60 s segments and
+ *   monotone there. The first-crossing oracle walks 10 s segments and
  *   binary-searches inside the one segment that brackets the level:
- *   O(segments · log 60), never O(seconds). Per-second motion comes from the
- *   interpolation slope between 60 s anchors; the 5-paise quantization is the
- *   bounded integer micro-noise on top of the multi-scale ramps.
+ *   O(segments · log 10), never O(seconds). Per-second motion comes from the
+ *   interpolation slope between 10 s anchors.
+ *
+ *   Timescale design (why 900/300/60/10 exist): a pure coarse stack makes
+ *   price exactly linear inside the coarsest recent window — 1m/5m candles
+ *   degenerate to zero wicks and colors streak for the whole wave spacing.
+ *   The sub-minute waves add genuine intrabar curvature (wicks on every
+ *   timeframe) and independent per-minute anchor hashes decorrelate
+ *   consecutive candle colors, while the 86400 wave keeps the gentle
+ *   day-scale macro drift. Amplitudes shrink with spacing so the path stays
+ *   visually organic, not jagged.
  *
  * Properties: O(1) per tick · integer arithmetic only (no floats, no
  * transcendental functions) · globally continuous · organic multi-scale
@@ -65,11 +73,14 @@ const COARSE_WAVES = [
   { spacing: 86_400n, waveBp: 120 }, // daily macro drift (per-day slope)
   { spacing: 21_600n, waveBp: 80 }, // 6-hour wave
   { spacing: 3_600n, waveBp: 55 }, // 1-hour wave
-  { spacing: 600n, waveBp: 30 }, // 10-minute wave
+  { spacing: 900n, waveBp: 30 }, // 15-minute wave
+  { spacing: 300n, waveBp: 18 }, // 5-minute wave
+  { spacing: 60n, waveBp: 11 }, // 1-minute wave (candle color decorrelation)
+  { spacing: 10n, waveBp: 7 }, // 10-second micro wave (intrabar wicks)
 ] as const;
 
 /** Anchor grid spacing (s): coarse-wave anchors all lie on this grid. */
-export const ANCHOR_GRID = 60n;
+export const ANCHOR_GRID = 10n;
 
 const seedCache = new Map<string, bigint>();
 function seedFor(symbol: string): bigint {
@@ -79,6 +90,31 @@ function seedFor(symbol: string): bigint {
     seedCache.set(symbol, seed);
   }
   return seed;
+}
+
+/**
+ * Memoized anchor values keyed by (symbol, grid index). Each tick evaluates
+ * 4 waves × 2 anchors; without the cache a candle-series pass over N seconds
+ * would re-hash the same anchors ~N/10× per wave. Bounded growth: one entry
+ * per 10 s of wall time per symbol (8,640/day/symbol) — the browser clears
+ * old symbols implicitly through chart unmounts; the backend only touches
+ * active symbols during settlement.
+ */
+const anchorCache = new Map<string, bigint>();
+function cachedAnchor(
+  symbol: string,
+  basePaise: number,
+  volBp: number,
+  seed: bigint,
+  gridSec: bigint,
+): bigint {
+  const key = symbol + ":" + gridSec.toString(36);
+  let v = anchorCache.get(key);
+  if (v === undefined) {
+    v = anchorValue(symbol, basePaise, volBp, seed, gridSec);
+    anchorCache.set(key, v);
+  }
+  return v;
 }
 
 /** Amplitude (paise) of one wave for one symbol. Integer, frozen. */
@@ -127,8 +163,8 @@ export function pricePaise(symbol: string, epochSec: bigint): bigint {
   }
   const seed = seedFor(symbol);
   const g = floorDiv(epochSec, ANCHOR_GRID) * ANCHOR_GRID;
-  const f0 = anchorValue(symbol, def.basePaise, def.volBp, seed, g);
-  const f1 = anchorValue(symbol, def.basePaise, def.volBp, seed, g + ANCHOR_GRID);
+  const f0 = cachedAnchor(symbol, def.basePaise, def.volBp, seed, g);
+  const f1 = cachedAnchor(symbol, def.basePaise, def.volBp, seed, g + ANCHOR_GRID);
   const raw = f0 + floorDiv((f1 - f0) * (epochSec - g), ANCHOR_GRID);
   const tick = BigInt(TICK_PAISE);
   return floorDiv(raw, tick) * tick;

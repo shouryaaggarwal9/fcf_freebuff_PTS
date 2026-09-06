@@ -261,6 +261,11 @@ export function BooksPanel({
                       <span className="ml-1.5 rounded border border-border px-1 py-0 font-mono text-[9px] text-muted-foreground">
                         {typeLabel(o.orderType)}
                       </span>
+                      {o.ocoId && (
+                        <span className="ml-1.5 rounded border border-gold/40 px-1 py-0 font-mono text-[9px] font-semibold text-gold">
+                          OCO
+                        </span>
+                      )}
                     </TableCell>
                     <TableCell className="tnum text-right font-mono">
                       {o.qty}
@@ -313,7 +318,9 @@ export function BooksPanel({
                 {history.map((o) => {
                   const fillSec = o.fillEpochSec ?? o.createdMs / 1000;
                   const realized =
-                    o.side === "SELL" && o.status === "FILLED"
+                    o.status === "FILLED" &&
+                    ((o.side === "SELL" && o.intent !== "OPEN_SHORT") ||
+                      o.intent === "COVER_SHORT")
                       ? (o.realizedPnlPaise ?? 0n)
                       : null;
                   return (
@@ -329,6 +336,9 @@ export function BooksPanel({
                         <span className="ml-1.5 rounded border border-border px-1 py-0 font-mono text-[9px] text-muted-foreground">
                           {typeLabel(o.orderType)}
                         </span>
+                        {o.ocoId && (
+                          <span className="ml-1.5 rounded border border-gold/40 px-1 py-0 font-mono text-[9px] font-semibold text-gold">OCO</span>
+                        )}
                         {o.reason === "DAY_END" && (
                           <span className="ml-1.5 text-[9px] text-gold">
                             sq-off

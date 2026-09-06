@@ -15,8 +15,16 @@
  * price, P&L or reserves. Quoted/fill prices are multiples of TICK_PAISE.
  */
 
-/** Bump only on a breaking generator/config change. Never silently. */
-export const MARKET_VERSION = 1;
+/**
+ * Bump only on a breaking generator/config change. Never silently.
+ *
+ * v1 → v2 (2026-09-06): refined generator — added 900/300/60/10-second waves
+ * and tightened the anchor grid 60 s → 10 s to restore intrabar wicks on 1m/5m
+ * charts and decorrelate consecutive candle colors. All open v1 state was
+ * settled (positions force-sold, orders expired) before the cutover; every
+ * second from the cutover onward is v2 history. Golden vectors regenerated.
+ */
+export const MARKET_VERSION = 2;
 
 /** Minimum price increment: ₹0.05. All quoted and fill prices are multiples. */
 export const TICK_PAISE = 5;

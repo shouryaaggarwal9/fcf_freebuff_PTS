@@ -51,8 +51,9 @@ deterministic generator. Client tick detection is only a request to
   cron), every OPEN order is re-evaluated over its eligible ticks
   `[ceil(createdMs/1000), min(now, dayEnd-1)]`. Because price is a pure
   function of (symbol, second), the server finds the exact historical trigger
-  tick with `firstTickWhere` — an O(segments · log 60) oracle that binary
-  searches inside 60 s segments (price is linear, hence monotone, there). An
+  tick with `firstTickWhere` — an O(segments · log 10) oracle that binary
+  searches inside 10 s anchor segments (price is linear, hence monotone,
+  there). An
   order that would have triggered at 03:14 while the user was away fills at
   that exact second at that exact price when they return.
 - **Fill pricing.** LIMIT orders fill at the trigger tick's own price
@@ -100,9 +101,12 @@ deterministic generator. Client tick detection is only a request to
 
 - [x] Deterministic, immutable past: `price(symbol, epochSec)` — integer
   hashing (FNV-1a/splitmix64 over 64-bit bigints), piecewise-linear
-  multi-scale waves on a 60 s anchor grid, no floats/transcendentals/
-  `Math.random`. Bit-identical across engines; portable to plpgsql-style
-  integer arithmetic if it ever needs to move back to Postgres.
+  multi-scale waves (86400/21600/3600/900/300/60/10 s) on a 10 s anchor
+  grid, no floats/transcendentals/`Math.random`. Bit-identical across
+  engines; portable to plpgsql-style integer arithmetic if it ever needs to
+  move back to Postgres. (v2, 2026-09-06: added sub-minute waves + 10 s grid
+  so 1m/5m candles carry wicks and colors decorrelate; v1 history was
+  settled and closed at the cutover — see MARKET_VERSION notes.)
 - [x] Server is sole authority for fills, time and money.
 - [x] Integer paise everywhere; ₹0.05 tick enforced server-side.
 - [x] Strict TypeScript, no `any`; `bun tsc -b --noEmit` clean.

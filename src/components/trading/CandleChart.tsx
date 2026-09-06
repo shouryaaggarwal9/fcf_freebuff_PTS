@@ -52,7 +52,7 @@ export function CandleChart({ symbol, candles, height = 400 }: CandleChartProps)
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
-  const keyRef = useRef<string>("");
+  const symbolRef = useRef<string>("");
   const pausedRef = useRef(false);
 
   // Mount the chart once. autoSize keeps it glued to its container.
@@ -142,10 +142,16 @@ export function CandleChart({ symbol, candles, height = 400 }: CandleChartProps)
       close: toRupee(c.closePaise),
     }));
     series.setData(data);
-    const key = `${symbol}:${data.length}`;
-    if (keyRef.current !== key) {
-      keyRef.current = key;
+    // Symbol change: re-fit BOTH axes. fitContent() only realigns the time
+    // axis; lightweight-charts also permanently disables price autoScale once
+    // the user drags the price axis, which left a new symbol rendering inside
+    // the previous symbol's locked range. Restoring autoScale here realigns
+    // the price axis on every symbol switch.
+    const symbolChanged = symbolRef.current !== symbol;
+    symbolRef.current = symbol;
+    if (symbolChanged) {
       chart.timeScale().fitContent();
+      chart.priceScale("right").applyOptions({ autoScale: true });
       pausedRef.current = false;
     } else if (!pausedRef.current) {
       chart.timeScale().scrollToRealTime();
