@@ -103,6 +103,7 @@ async function ensureWallet(
   const walletId = await ctx.db.insert("wallets", {
     userId,
     availableCashPaise: GRANT_PAISE,
+    marginBlockPaise: 0n,
     version: 1,
     createdAtMs: nowMs,
     updatedMs: nowMs,
@@ -128,6 +129,8 @@ async function moveCash(
   timeMs: number,
   dayStartSec: number,
   extra: LedgerExtra = {},
+  /** Simultaneous change to the margin sub-account (block/unblock). */
+  marginDeltaPaise: bigint = 0n,
 ): Promise<void> {
   await ctx.db.insert("ledger", {
     userId: wallet.userId,
@@ -138,9 +141,15 @@ async function moveCash(
     ...(extra.orderId ? { orderId: extra.orderId } : {}),
     ...(extra.positionId ? { positionId: extra.positionId } : {}),
   });
+  // Mutate the in-memory snapshot too: several moveCash calls can run in one
+  // transaction (release → pay), and each must see the previous one's result.
+  wallet.availableCashPaise += deltaPaise;
+  wallet.marginBlockPaise = (wallet.marginBlockPaise ?? 0n) + marginDeltaPaise;
+  wallet.version += 1;
   await ctx.db.patch(wallet._id, {
-    availableCashPaise: wallet.availableCashPaise + deltaPaise,
-    version: wallet.version + 1,
+    availableCashPaise: wallet.availableCashPaise,
+    marginBlockPaise: wallet.marginBlockPaise,
+    version: wallet.version,
     updatedMs: timeMs,
   });
 }
@@ -323,7 +332,11 @@ async function applyBuyFill(
   if (isCover) {
     const pos = existing;
     if (pos.qty < order.qty) {
-      // Stale cover (short already closed elsewhere). Retire, keep ledger.
+      // Stale cover (short already closed elsewhere). Retire; release any
+      // resting reserve so the cash is not stranded.
+      if (order.reservedCashPaise > 0n) {
+        await moveCash(ctx, wallet, order.reservedCashPaise, "reserve_release", nowMs, order.dayStartSec, { orderId: order._id });
+      }
       await ctx.db.patch(order._id, {
         status: "CANCELLED",
         reason: "MANUAL",
@@ -334,32 +347,38 @@ async function applyBuyFill(
     const q = BigInt(order.qty);
     const avgCost = pos.avgCostPaise;
     const payment = BigInt(order.qty) * fillPricePaise;
-    const release = (pos.marginPaise ?? 2n * avgCost * BigInt(pos.qty)) * q / BigInt(pos.qty);
-    // A reserve-less (market) cover must be payable out of current cash;
-    // resting covers carry their own reserve and release it below.
-    if (order.reservedCashPaise === 0n && payment > wallet.availableCashPaise) {
+    // Cover accounting (margin sub-account). At entry, 2× notional was
+    // blocked: S of collateral + S of sale proceeds parked. The cover:
+    //   1. releases the position's block slice (2S × q/Q),
+    //   2. pays the fill (P × q),
+    //   3. credits the parked sale proceeds (S_avg × q) — the "sale"
+    //      completes when the borrowed shares are returned.
+    // Net cash Δ = 2S − P + S = realized P&L (S − P) + released collateral.
+    // Round trip from flat: (−2S at entry) + (3S − P here) = S − P ✓.
+    // Worst case (guaranteed stop at P = 2S): net Δ = +S ≥ 0 — the wallet
+    // cannot overdraw; the block drains exactly to 0 at full cover.
+    const blockSlice = (pos.marginPaise ?? 2n * avgCost * BigInt(pos.qty)) * q / BigInt(pos.qty);
+    const realized = (avgCost - fillPricePaise) * q;
+    // A reserve-less (market) cover must be payable out of current cash plus
+    // the release arriving in this transaction; resting covers carry their
+    // own reserve and release it below.
+    if (order.reservedCashPaise === 0n && payment > wallet.availableCashPaise + blockSlice) {
       fail("Cover blocked: payment exceeds available cash (auto-cover stop protects you before 2× entry)");
     }
     if (order.reservedCashPaise > 0n) {
       await moveCash(ctx, wallet, order.reservedCashPaise, "reserve_release", nowMs, order.dayStartSec, { orderId: order._id });
     }
+    // Single ledger row: net cash effect = block slice + realized; the
+    // margin block falls by the slice, draining to 0 at full cover.
     await moveCash(
       ctx,
       wallet,
-      release,
-      "margin_release",
+      blockSlice + realized,
+      "cover_settle",
       nowMs,
       order.dayStartSec,
       { orderId: order._id, positionId: pos._id },
-    );
-    await moveCash(
-      ctx,
-      wallet,
-      -payment,
-      "cover_fill",
-      nowMs,
-      order.dayStartSec,
-      { orderId: order._id, positionId: pos._id },
+      -blockSlice,
     );
     await upsertBuyPosition(
       ctx,
@@ -488,7 +507,11 @@ async function applySellFill(
     // 2 × level × qty + 2 × qty × SLIP ≥ 2 × (level ± 50p) × qty.
     if (!pos || posSide(pos) !== "SHORT") {
       if (pos) fail("short entry over an existing long position (invariant violated)");
-      // FLAT → open short. Release the reserve as margin.
+      // FLAT → open short. A resting entry's reserve (2× level × qty +
+      // headroom) was debited at placement and releases here; a market
+      // entry never had a reserve (reservedCashPaise = 0). Either way the
+      // settled margin is blocked in the wallet's margin sub-account —
+      // collateral + parked sale proceeds, released at cover.
       if (order.reservedCashPaise > 0n) {
         await moveCash(ctx, wallet, order.reservedCashPaise, "reserve_release", nowMs, order.dayStartSec, { orderId: order._id });
       }
@@ -509,20 +532,23 @@ async function applySellFill(
         createdMs: nowMs,
         updatedMs: nowMs,
       });
+      await moveCash(ctx, wallet, 0n, "margin_block", nowMs, order.dayStartSec, { orderId: order._id }, -margin);
     } else {
       // Extend the short: weighted average entry, margin += 2 × fill notional.
       const q = BigInt(order.qty);
       const newQty = pos.qty + order.qty;
       const avg = (pos.avgCostPaise * BigInt(pos.qty) + fillPricePaise * q) / BigInt(newQty);
+      const addMargin = 2n * q * fillPricePaise;
       await ctx.db.patch(pos._id, {
         qty: newQty,
         avgCostPaise: avg,
-        marginPaise: (pos.marginPaise ?? 0n) + 2n * q * fillPricePaise,
+        marginPaise: (pos.marginPaise ?? 0n) + addMargin,
         updatedMs: nowMs,
       });
       if (order.reservedCashPaise > 0n) {
         await moveCash(ctx, wallet, order.reservedCashPaise, "reserve_release", nowMs, order.dayStartSec, { orderId: order._id });
       }
+      await moveCash(ctx, wallet, 0n, "margin_block", nowMs, order.dayStartSec, { orderId: order._id }, -addMargin);
     }
     await ctx.db.patch(order._id, {
       status: "FILLED",
@@ -637,19 +663,22 @@ async function forceCoverPosition(
   const fp = pricePaise(pos.symbol, lastTick);
   const payment = BigInt(pos.qty) * fp;
   const realized = (pos.avgCostPaise - fp) * BigInt(pos.qty);
-  const release = pos.marginPaise ?? 2n * pos.avgCostPaise * BigInt(pos.qty);
-  if (payment > wallet.availableCashPaise + release) {
-    fail("day-end cover exceeds cash + margin (invariant violated)");
+  // Same settlement split as manual covers: net cash Δ = block + realized;
+  // the block drains to 0 (guarded: the last tick is bounded far below 2×
+  // avg by the v2 wave envelope, so net Δ ≥ 0 always holds).
+  const block = pos.marginPaise ?? 2n * pos.avgCostPaise * BigInt(pos.qty);
+  if (block + realized < 0n) {
+    fail("day-end cover exceeds blocked margin (invariant violated)");
   }
-  await moveCash(ctx, wallet, release, "margin_release", nowMs, pos.dayStartSec, { positionId: pos._id });
   await moveCash(
     ctx,
     wallet,
-    -payment,
-    "cover_fill",
+    block + realized,
+    "cover_settle",
     nowMs,
     pos.dayStartSec,
     { positionId: pos._id },
+    -block,
   );
   const orderId = await ctx.db.insert("orders", {
     userId: pos.userId,
@@ -804,11 +833,9 @@ export async function reconcileCore(
         .collect()
     ).find((o) => o.reason === "AUTO" && o.status === "OPEN");
     if (!existingAuto) {
-      // Margin + headroom reserve: the fill pays ≤ level (guaranteed stop),
-      // the release funds it — reserve is a self-funded safety net.
-      const reserve = 2n * BigInt(pos.qty) * stopLevel + 2n * BigInt(pos.qty) * SHORT_ENTRY_SLIP_PAISE;
-      if (reserve > wallet.availableCashPaise) continue; // cannot post reserve (see note below)
-      await moveCash(ctx, wallet, -reserve, "reserve", nowMs, pos.dayStartSec, {});
+      // No cash reserve: the entry's margin block IS the safety net (the
+      // guaranteed stop fills at ≤ 2× avg, where block ≥ payment and the
+      // net settlement can never debit cash below zero).
       await ctx.db.insert("orders", {
         userId,
         symbol: pos.symbol,
@@ -818,7 +845,7 @@ export async function reconcileCore(
         qty: pos.qty,
         stopPaise: stopLevel,
         refPricePaise: stopLevel,
-        reservedCashPaise: reserve,
+        reservedCashPaise: 0n,
         dayStartSec: pos.dayStartSec,
         createdMs: nowMs,
         reason: "AUTO",
@@ -826,18 +853,10 @@ export async function reconcileCore(
         version: 1,
       });
     } else if (existingAuto.stopPaise !== stopLevel || existingAuto.qty !== pos.qty) {
-      const oldReserve = existingAuto.reservedCashPaise;
-      const reserve = 2n * BigInt(pos.qty) * stopLevel + 2n * BigInt(pos.qty) * SHORT_ENTRY_SLIP_PAISE;
-      const delta = reserve - oldReserve;
-      if (delta > 0n && delta > wallet.availableCashPaise) continue;
-      if (delta !== 0n) {
-        await moveCash(ctx, wallet, -delta, delta > 0n ? "reserve" : "reserve_release", nowMs, pos.dayStartSec, { orderId: existingAuto._id });
-      }
       await ctx.db.patch(existingAuto._id, {
         qty: pos.qty,
         stopPaise: stopLevel,
         refPricePaise: stopLevel,
-        reservedCashPaise: reserve,
         version: existingAuto.version + 1,
       });
     }
@@ -1351,8 +1370,20 @@ export const editOrder = mutation({
           .withIndex("by_user", (q) => q.eq("userId", userId))
           .first();
         if (!wallet2) fail("Account not funded");
-        const pos = await getPosition(ctx, userId, order.symbol, dayStart);
-        if (!pos || pos.qty < qty) fail("Sell blocked: not enough held quantity");
+        const isShortEntry =
+          order.intent === "OPEN_SHORT" || order.intent === "ADD_SHORT";
+        if (isShortEntry) {
+          // Editing a resting short entry that is now marketable: it opens/
+          // extends the short at spot — margin, not holdings, is the gate.
+          const margin = 2n * BigInt(qty) * spot;
+          const alreadyReserved = order.reservedCashPaise;
+          if (margin - alreadyReserved > wallet2.availableCashPaise) {
+            fail("Insufficient margin for the updated short entry");
+          }
+        } else {
+          const pos = await getPosition(ctx, userId, order.symbol, dayStart);
+          if (!pos || pos.qty < qty) fail("Sell blocked: not enough held quantity");
+        }
         await ctx.db.patch(order._id, {
           qty,
           version: order.version + 1,
@@ -1370,7 +1401,10 @@ export const editOrder = mutation({
     if (order.ocoId) {
       await cancelOcoSiblings(ctx, userId, order.ocoId, order._id);
     }
-    if (order.side === "SELL") {
+    const editOpensShort =
+      order.side === "SELL" &&
+      (order.intent === "OPEN_SHORT" || order.intent === "ADD_SHORT");
+    if (order.side === "SELL" && !editOpensShort) {
       await validateSellCapacity(ctx, userId, order.symbol, dayStart, qty, {
         orderId: order._id,
         qty,
@@ -1388,7 +1422,14 @@ export const editOrder = mutation({
       order.orderType === "LIMIT" ? (limit as bigint)
         : order.orderType === "STOP" ? (stop as bigint)
           : spot;
-    const newReserved = order.side === "BUY" ? BigInt(qty) * refPrice : 0n;
+    // Short entries keep their margin reserve semantics on edit (2× notional
+    // + overshoot headroom); BUY reserves its level notional; long-exit
+    // sells reserve nothing.
+    const newReserved = order.side === "BUY"
+      ? BigInt(qty) * refPrice
+      : editOpensShort
+        ? 2n * BigInt(qty) * refPrice + 2n * BigInt(qty) * SHORT_ENTRY_SLIP_PAISE
+        : 0n;
     const oldReserved = order.reservedCashPaise;
     const delta = newReserved - oldReserved;
     if (delta > 0n && delta > wallet.availableCashPaise) {
@@ -1439,6 +1480,7 @@ export const getAccount = query({
     return {
       userId,
       availableCashPaise: wallet.availableCashPaise,
+      marginBlockedPaise: wallet.marginBlockPaise ?? 0n,
       updatedMs: wallet.updatedMs,
       grantPaise: GRANT_PAISE,
     };

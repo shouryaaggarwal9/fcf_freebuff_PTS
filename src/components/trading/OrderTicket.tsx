@@ -89,7 +89,8 @@ export function OrderTicket({
     onSymbolChange(prefill.symbol);
     setSide(prefill.side);
     if (prefill.qty !== undefined) setQtyStr(String(prefill.qty));
-    if (prefill.side === "SELL") setKind("MARKET");
+    // Square-off prefills (from the positions book) default to market.
+    if (prefill.qty !== undefined || prefill.side === "SELL") setKind("MARKET");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [prefill]);
 

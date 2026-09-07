@@ -118,6 +118,25 @@ export function applyTrade(
   };
 }
 
+/**
+ * Cover settlement splits for a short cover fill: the proportional
+ * margin-block release and the cash payment. Used by every cover path
+ * (manual covers, brackets, the auto-cover stop, day-end force-cover) so
+ * the wallet identity holds everywhere: cash delta = release − payment.
+ */
+export function coverSettlement(
+  marginBlockPaise: bigint,
+  qty: number,
+  posQty: number,
+  fillPricePaise: bigint,
+): { blockReleasePaise: bigint; paymentPaise: bigint } {
+  const q = BigInt(qty);
+  return {
+    blockReleasePaise: (marginBlockPaise * q) / BigInt(posQty),
+    paymentPaise: q * fillPricePaise,
+  };
+}
+
 /** Mark-to-market in paise (signed; negative = losing). */
 export function positionMtm(
   state: { side?: PositionSide | string | null; qty: number; avgCostPaise: bigint },

@@ -27,7 +27,9 @@ const ENTRY_LABEL: Record<string, string> = {
   reserve_release: "Reservation released",
   buy_fill: "Buy fill",
   sell_fill: "Sell fill",
-};
+  margin_block: "Margin blocked (short entry)",
+  cover_settle: "Short cover settlement",
+};;
 
 export default function Ledger() {
   const { isAuthenticated, isLoading: authLoading } = useAuth();
@@ -89,6 +91,7 @@ export default function Ledger() {
                     r.entryType === "deposit" ||
                     r.entryType === "reserve_release" ||
                     r.entryType === "sell_fill" ||
+                    r.entryType === "cover_settle" ||
                     (r.entryType !== "reserve" && r.entryType !== "buy_fill" && r.amountPaise > 0n);
                   return (
                     <TableRow key={r._id} className="hover:bg-muted/30">

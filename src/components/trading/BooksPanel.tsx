@@ -151,7 +151,7 @@ export function BooksPanel({
         {positions.length === 0 ? (
           <Empty
             icon={<BookOpenText className="size-4" />}
-            text="No open positions today. Buy any of the 10 NSE symbols — everything is force-squared at the day rollover (00:00 UTC)."
+            text="No open positions today. Buy to go long, or SELL flat to short — everything is force-squared at the day rollover (00:00 UTC)."
           />
         ) : (
           <div className="scrollbar-thin overflow-x-auto">
@@ -170,7 +170,10 @@ export function BooksPanel({
               <TableBody>
                 {positions.map((p) => {
                   const ltp = pricePaise(p.symbol, BigInt(nowSec));
-                  const pnl = (ltp - p.avgCostPaise) * BigInt(p.qty);
+                  const isShort = p.side === "SHORT";
+                  const pnl = isShort
+                    ? (p.avgCostPaise - ltp) * BigInt(p.qty)
+                    : (ltp - p.avgCostPaise) * BigInt(p.qty);
                   const value = ltp * BigInt(p.qty);
                   const up = pnl >= 0n;
                   return (
@@ -179,8 +182,13 @@ export function BooksPanel({
                         <span className="font-mono text-[13px] font-bold">
                           {p.symbol}
                         </span>
-                        <span className="ml-2 text-[10px] text-muted-foreground">
-                          intraday
+                        <span
+                          className={cn(
+                            "ml-2 rounded px-1 py-0 font-mono text-[9px] font-bold",
+                            isShort ? "bg-down/15 text-down" : "bg-up/15 text-up",
+                          )}
+                        >
+                          {isShort ? "SHORT" : "LONG"}
                         </span>
                       </TableCell>
                       <TableCell className="tnum text-right font-mono">
@@ -208,10 +216,15 @@ export function BooksPanel({
                           type="button"
                           variant="outline"
                           size="sm"
-                          className="h-7 border-down/30 px-2 text-[11px] text-down hover:bg-down/10 hover:text-down"
+                          className={cn(
+                            "h-7 px-2 text-[11px]",
+                            isShort
+                              ? "border-up/30 text-up hover:bg-up/10 hover:text-up"
+                              : "border-down/30 text-down hover:bg-down/10 hover:text-down",
+                          )}
                           onClick={() => onSell(p)}
                         >
-                          Sell
+                          {isShort ? "Cover" : "Sell"}
                         </Button>
                       </TableCell>
                     </TableRow>

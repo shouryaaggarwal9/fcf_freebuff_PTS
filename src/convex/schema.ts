@@ -47,6 +47,8 @@ const schema = defineSchema(
     wallets: defineTable({
       userId: v.id("users"),
       availableCashPaise: v.bigint(),
+      /** Margin sub-account: cash blocked by open SHORT positions. */
+      marginBlockPaise: v.optional(v.bigint()),
       version: v.number(),
       createdAtMs: v.number(),
       updatedMs: v.number(),

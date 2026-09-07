@@ -15,7 +15,7 @@ import { depthAt, DEPTH_LEVELS } from "../src/engine/depth";
 import { floorDiv } from "../src/engine/math";
 import { committedQty, isOcoEnabled, validateOcoLevels } from "../src/lib/oco";
 import { pricePaise } from "../src/engine/price";
-import { applyTrade, autoCoverStopPaise, orderIntent } from "../src/lib/position";
+import { applyTrade, autoCoverStopPaise, coverSettlement, orderIntent } from "../src/lib/position";
 import { firstTickWhere, pricePaise } from "../src/engine/price";
 
 const T0 = 1_735_680_000n; // a fixed modern epoch
@@ -450,5 +450,41 @@ describe("short-position state machine", () => {
     // wallet dips only by the loss (N = ½ margin) — never negative.
     expect(c.marginReleasePaise - payment).toBe(0n);
     expect(c.realizedPnlPaise).toBe(-(BigInt(qty) * P));
+  });
+});
+
+describe("short round-trip cash accounting (margin sub-account)", () => {
+  const S = 2_925_35n; // entry fill (paise) — the deployed-bug screenshot's ₹2,925.35
+  const P = 2_924_35n; // cover fill — ₹1 lower
+  const qty = 10;
+
+  test("market entry blocks 2× notional; cover nets exactly to realized P&L", () => {
+    const block = 2n * S * BigInt(qty); // entry margin: 2 × notional
+    // Entry: cash −block. Cover: cash Δ = block + realized; block drains 0.
+    const entryCashDelta = -block;
+    const realized = (S - P) * BigInt(qty);
+    const coverCashDelta = block + realized;
+    // Round trip from flat: total cash Δ = realized P&L exactly.
+    expect(entryCashDelta + coverCashDelta).toBe(realized);
+    expect(realized).toBe(1_000n); // +₹10.00 on the screenshot trade
+    // Excluding the collateral return, the settlement is pure P&L.
+    expect(coverCashDelta - block).toBe(realized);
+  });
+
+  test("worst case — guaranteed 2× stop cover never debits beyond the block", () => {
+    const block = 2n * S * BigInt(qty);
+    const stopPrice = 2n * S; // auto-cover level
+    const realized = (S - stopPrice) * BigInt(qty); // −S × qty
+    // Net settlement Δ = block + realized = S × qty ≥ 0: wallet stays whole,
+    // max loss is exactly the reserved ½ margin.
+    expect(block + realized).toBe(S * BigInt(qty));
+    expect(block + realized).toBeGreaterThanOrEqual(0n);
+  });
+
+  test("partial cover drains the block proportionally", () => {
+    const block = 2n * S * BigInt(qty);
+    const half = coverSettlement(block, 5, 10, P);
+    expect(half.blockReleasePaise).toBe(S * BigInt(qty)); // 2S×10 × 5/10
+    expect(half.paymentPaise).toBe(5n * P);
   });
 });

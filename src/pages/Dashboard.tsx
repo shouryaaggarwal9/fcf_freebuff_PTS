@@ -149,7 +149,16 @@ export default function Dashboard() {
 
   const holdingsValue = useMemo(
     () =>
-      positionRows.reduce((sum, p) => sum + p.ltp * BigInt(p.qty), 0n),
+      positionRows.reduce(
+        (sum, p) =>
+          sum +
+          (p.side === "SHORT"
+            ? // Short: blocked margin minus the buy-back liability.
+              (p.marginPaise ?? 2n * p.avgCostPaise * BigInt(p.qty)) -
+              BigInt(p.qty) * p.ltp
+            : p.ltp * BigInt(p.qty)),
+        0n,
+      ),
     [positionRows],
   );
   const unrealized = useMemo(
@@ -222,7 +231,8 @@ export default function Dashboard() {
 
   const sellPosition = (p: PositionRow) => {
     setActiveSymbol(p.symbol);
-    setPrefill({ symbol: p.symbol, side: "SELL", qty: p.qty });
+    // A short is squared off by BUYING it back, not selling.
+    setPrefill({ symbol: p.symbol, side: p.side === "SHORT" ? "BUY" : "SELL", qty: p.qty });
     if (window.innerWidth < 1024) {
       document
         .getElementById("order-ticket")
