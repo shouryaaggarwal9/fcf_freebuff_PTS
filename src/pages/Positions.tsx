@@ -78,7 +78,8 @@ export default function Positions() {
     }
   };
 
-  const cash = account?.availableCashPaise ?? 0n;
+  // Headline cash: total, including margin blocked on open shorts.
+  const cash = (account?.availableCashPaise ?? 0n) + (account?.marginBlockedPaise ?? 0n);
 
   return (
     <TradingShell active="positions" cash={cash}>

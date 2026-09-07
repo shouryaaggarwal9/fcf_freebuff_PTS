@@ -128,6 +128,8 @@ export default function Dashboard() {
 
   /* ---------------------------- derived data ---------------------------- */
   const cash = account?.availableCashPaise ?? 0n;
+  // Headline cash (header/footer): total, including margin blocked on shorts.
+  const totalCash = cash + (account?.marginBlockedPaise ?? 0n);
   const todayStart = dayStartOfSec(nowSec);
 
   const holdingsBySymbol = useMemo(() => {
@@ -267,7 +269,7 @@ export default function Dashboard() {
   const dayPnl = realizedToday + unrealized;
 
   return (
-    <TradingShell active="terminal" cash={cash}>
+    <TradingShell active="terminal" cash={totalCash}>
             {/* account summary */}
             <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
               <StatCard

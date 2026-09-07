@@ -57,9 +57,12 @@ const schema = defineSchema(
     /** Append-only cash-flow ledger. Rows are never updated or deleted. */
     ledger: defineTable({
       userId: v.id("users"),
-      /** deposit | buy_fill | sell_fill | reserve | reserve_release */
+      /** deposit | buy_fill | sell_fill | reserve | reserve_release | margin_block | cover_settle */
       entryType: v.string(),
+      /** Impact on TOTAL cash (available + blocked + reserved); ₹0 for earmark events. */
       amountPaise: v.bigint(),
+      /** Earmark size for display (margin blocked/released, reserve amount). */
+      detailPaise: v.optional(v.bigint()),
       orderId: v.optional(v.id("orders")),
       positionId: v.optional(v.id("positions")),
       /** UTC start-of-day the entry belongs to (display grouping). */

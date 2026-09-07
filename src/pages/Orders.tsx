@@ -77,7 +77,8 @@ export default function Orders() {
   const [canceling, setCanceling] = useState<Id<"orders"> | null>(null);
 
   const rows = orders ?? [];
-  const cash = account?.availableCashPaise ?? 0n;
+  // Headline cash: total, including margin blocked on open shorts.
+  const cash = (account?.availableCashPaise ?? 0n) + (account?.marginBlockedPaise ?? 0n);
   const reserved = rows.reduce(
     (s, o) => s + (o.side === "BUY" ? o.reservedCashPaise : 0n),
     0n,

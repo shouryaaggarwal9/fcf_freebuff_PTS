@@ -42,7 +42,7 @@ export const BOOK_NAV: {
 interface TradingShellProps {
   /** Which nav item is active (BOOK_NAV key). */
   active: string;
-  /** Available cash for the mobile top bar (bigint paise). */
+  /** Total cash (available + blocked margin) for the top bar/footer (paise). */
   cash: bigint;
   children: ReactNode;
 }

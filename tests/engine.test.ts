@@ -15,7 +15,13 @@ import { depthAt, DEPTH_LEVELS } from "../src/engine/depth";
 import { floorDiv } from "../src/engine/math";
 import { committedQty, isOcoEnabled, validateOcoLevels } from "../src/lib/oco";
 import { pricePaise } from "../src/engine/price";
-import { applyTrade, autoCoverStopPaise, coverSettlement, orderIntent } from "../src/lib/position";
+import {
+  applyTrade,
+  autoCoverStopPaise,
+  coverSettlement,
+  ledgerRowFor,
+  orderIntent,
+} from "../src/lib/position";
 import { firstTickWhere, pricePaise } from "../src/engine/price";
 
 const T0 = 1_735_680_000n; // a fixed modern epoch
@@ -486,5 +492,59 @@ describe("short round-trip cash accounting (margin sub-account)", () => {
     const half = coverSettlement(block, 5, 10, P);
     expect(half.blockReleasePaise).toBe(S * BigInt(qty)); // 2S×10 × 5/10
     expect(half.paymentPaise).toBe(5n * P);
+  });
+});
+
+describe("ledger row semantics (amount = total-cash impact)", () => {
+  test("margin block is a ₹0-impact earmark carrying the blocked size", () => {
+    const margin = 2n * 10n * 289_170n; // ₹57,834
+    const row = ledgerRowFor("margin_block", -margin, margin);
+    expect(row.amountPaise).toBe(0n);
+    expect(row.detailPaise).toBe(margin);
+  });
+
+  test("cover settlement nets to realized P&L with the release in detail", () => {
+    const release = 578_340n;
+    const realized = 1_600n; // ₹16
+    const row = ledgerRowFor("cover_settle", release + realized, -release);
+    expect(row.amountPaise).toBe(realized);
+    expect(row.detailPaise).toBe(release);
+  });
+
+  test("order reserves never move the balance", () => {
+    const reserve = ledgerRowFor("reserve", -700_000n);
+    expect(reserve.amountPaise).toBe(0n);
+    expect(reserve.detailPaise).toBe(700_000n);
+    const release = ledgerRowFor("reserve_release", 700_000n);
+    expect(release.amountPaise).toBe(0n);
+    expect(release.detailPaise).toBe(700_000n);
+  });
+
+  test("market short round trip: sum of ledger amounts = realized P&L exactly", () => {
+    const margin = 2n * 10n * 289_170n; // ₹57,834
+    const realized = 1_600n; // (2891.70 − 2890.10) × 10
+    const block = ledgerRowFor("margin_block", -margin, margin);
+    const settle = ledgerRowFor("cover_settle", margin + realized, -margin);
+    expect(block.amountPaise + settle.amountPaise).toBe(realized);
+  });
+
+  test("resting short round trip: reserve rows are ₹0, net is still the P&L", () => {
+    const margin = 2n * 10n * 289_170n;
+    const headroom = 2n * 10n * 100n; // 2 × qty × SLIP
+    const realized = 1_600n;
+    const amounts = [
+      ledgerRowFor("reserve", -(margin + headroom)).amountPaise,
+      ledgerRowFor("reserve_release", margin + headroom).amountPaise,
+      ledgerRowFor("margin_block", -margin, margin).amountPaise,
+      ledgerRowFor("cover_settle", margin + realized, -margin).amountPaise,
+    ];
+    expect(amounts.reduce((a, b) => a + b, 0n)).toBe(realized);
+  });
+
+  test("long fills and deposits are full total-impact rows", () => {
+    expect(ledgerRowFor("buy_fill", -289_170n).amountPaise).toBe(-289_170n);
+    expect(ledgerRowFor("buy_fill", -289_170n).detailPaise).toBeUndefined();
+    expect(ledgerRowFor("sell_fill", 289_330n).amountPaise).toBe(289_330n);
+    expect(ledgerRowFor("deposit", 10_000_000_00n).amountPaise).toBe(10_000_000_00n);
   });
 });

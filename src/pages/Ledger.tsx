@@ -29,7 +29,15 @@ const ENTRY_LABEL: Record<string, string> = {
   sell_fill: "Sell fill",
   margin_block: "Margin blocked (short entry)",
   cover_settle: "Short cover settlement",
-};;
+};
+
+/** Earmark detail line: the size of the pocket-to-pocket move. */
+const DETAIL_LABEL: Partial<Record<string, (paise: bigint) => string>> = {
+  reserve: (p) => `${formatINR(p)} earmarked`,
+  reserve_release: (p) => `${formatINR(p)} released`,
+  margin_block: (p) => `${formatINR(p)} blocked`,
+  cover_settle: (p) => `${formatINR(p)} margin released`,
+};
 
 export default function Ledger() {
   const { isAuthenticated, isLoading: authLoading } = useAuth();
@@ -49,10 +57,13 @@ export default function Ledger() {
   }, [ledger]);
 
   return (
-    <TradingShell active="ledger" cash={account?.availableCashPaise ?? 0n}>
+    <TradingShell
+      active="ledger"
+      cash={(account?.availableCashPaise ?? 0n) + (account?.marginBlockedPaise ?? 0n)}
+    >
       <PageHeader
         title="Cash ledger"
-        sub="Append-only record of every rupee movement. Balances are computed by the server; rows are immutable."
+        sub="Append-only record of every rupee movement. Balance = your cash including blocked margin and reserves — only deposits, fills and settlements move it."
         right={
           <span className="tnum rounded-lg border border-border bg-card px-3 py-1.5 font-mono text-[12px] text-muted-foreground">
             {rows.length} entries · funded {formatINR(deposits)}
@@ -87,22 +98,25 @@ export default function Ledger() {
               </TableHeader>
               <TableBody>
                 {rows.map((r) => {
-                  const isCredit =
-                    r.entryType === "deposit" ||
-                    r.entryType === "reserve_release" ||
-                    r.entryType === "sell_fill" ||
-                    r.entryType === "cover_settle" ||
-                    (r.entryType !== "reserve" && r.entryType !== "buy_fill" && r.amountPaise > 0n);
+                  const isNeutral = r.amountPaise === 0n;
+                  const isCredit = r.amountPaise > 0n;
                   return (
                     <TableRow key={r._id} className="hover:bg-muted/30">
                       <TableCell className="tnum whitespace-nowrap font-mono text-[11px] text-muted-foreground">
                         {istDayLabel(r.timeMs)} {istTimeLabel(r.timeMs)}
                       </TableCell>
-                      <TableCell className="text-[12px]">{ENTRY_LABEL[r.entryType] ?? r.entryType}</TableCell>
+                      <TableCell className="text-[12px]">
+                        {ENTRY_LABEL[r.entryType] ?? r.entryType}
+                        {r.detailPaise !== undefined && (
+                          <span className="block text-[11px] font-normal text-muted-foreground">
+                            {DETAIL_LABEL[r.entryType]?.(r.detailPaise) ?? formatINR(r.detailPaise)}
+                          </span>
+                        )}
+                      </TableCell>
                       <TableCell
                         className={cn(
                           "tnum text-right font-mono font-semibold",
-                          isCredit ? "text-up" : "text-down",
+                          isNeutral ? "text-muted-foreground" : isCredit ? "text-up" : "text-down",
                         )}
                       >
                         {isCredit ? "+" : ""}

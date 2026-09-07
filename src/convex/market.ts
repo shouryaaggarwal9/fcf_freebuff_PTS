@@ -22,6 +22,7 @@ import { DAY_SECONDS, GRANT_PAISE, isSymbol } from "../config/market";
 import type { OrderTrigger } from "../engine/model";
 import { isMultipleOf } from "../engine/math";
 import { committedQty, ocoGroupId } from "../lib/oco";
+import { ledgerRowFor } from "../lib/position";
 import type { OcoSellRef } from "../lib/oco";
 import {
   findFillTick,
@@ -132,10 +133,15 @@ async function moveCash(
   /** Simultaneous change to the margin sub-account (block/unblock). */
   marginDeltaPaise: bigint = 0n,
 ): Promise<void> {
+  // Ledger amounts are the impact on TOTAL cash (see ledgerRowFor): earmark
+  // events are ₹0 rows with the moved size in detailPaise, so the running
+  // balance only moves on deposits, fills and settlements.
+  const row = ledgerRowFor(entryType, deltaPaise, marginDeltaPaise);
   await ctx.db.insert("ledger", {
     userId: wallet.userId,
     entryType,
-    amountPaise: deltaPaise,
+    amountPaise: row.amountPaise,
+    ...(row.detailPaise !== undefined ? { detailPaise: row.detailPaise } : {}),
     dayStartSec,
     timeMs,
     ...(extra.orderId ? { orderId: extra.orderId } : {}),
@@ -532,7 +538,7 @@ async function applySellFill(
         createdMs: nowMs,
         updatedMs: nowMs,
       });
-      await moveCash(ctx, wallet, 0n, "margin_block", nowMs, order.dayStartSec, { orderId: order._id }, -margin);
+      await moveCash(ctx, wallet, -margin, "margin_block", nowMs, order.dayStartSec, { orderId: order._id }, margin);
     } else {
       // Extend the short: weighted average entry, margin += 2 × fill notional.
       const q = BigInt(order.qty);
@@ -548,7 +554,7 @@ async function applySellFill(
       if (order.reservedCashPaise > 0n) {
         await moveCash(ctx, wallet, order.reservedCashPaise, "reserve_release", nowMs, order.dayStartSec, { orderId: order._id });
       }
-      await moveCash(ctx, wallet, 0n, "margin_block", nowMs, order.dayStartSec, { orderId: order._id }, -addMargin);
+      await moveCash(ctx, wallet, -addMargin, "margin_block", nowMs, order.dayStartSec, { orderId: order._id }, addMargin);
     }
     await ctx.db.patch(order._id, {
       status: "FILLED",
@@ -1121,10 +1127,15 @@ export const placeOrder = mutation({
       // reserve released ≥ margin blocked at fill, always.
       const notional = BigInt(args.qty) * refPrice;
       const margin = 2n * notional;
-      reserved = fillNow ? margin : margin + 2n * BigInt(args.qty) * SHORT_ENTRY_SLIP_PAISE;
-      if (reserved > wallet.availableCashPaise) {
+      // Market entries block margin at fill in the same transaction — the
+      // order row must carry NO reserve (a stamped-but-never-debited reserve
+      // would release as phantom income at fill). Resting entries reserve
+      // margin + overshoot headroom at placement, released at fill.
+      reserved = fillNow ? 0n : margin + 2n * BigInt(args.qty) * SHORT_ENTRY_SLIP_PAISE;
+      const cashNeeded = fillNow ? margin : reserved;
+      if (cashNeeded > wallet.availableCashPaise) {
         fail(
-          `Insufficient margin: shorting ${args.qty} ${args.symbol} blocks ₹${(reserved / 100n).toString()} (2× notional${fillNow ? "" : " + overshoot headroom"})`,
+          `Insufficient margin: shorting ${args.qty} ${args.symbol} blocks ₹${(cashNeeded / 100n).toString()} (2× notional${fillNow ? "" : " + overshoot headroom"})`,
         );
       }
     } else if (args.side === "BUY" && state === "SHORT" && existingPos) {

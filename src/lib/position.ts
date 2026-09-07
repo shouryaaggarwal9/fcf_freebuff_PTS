@@ -168,3 +168,34 @@ export function orderIntent(
 export function autoCoverStopPaise(avgCostPaise: bigint): bigint {
   return 2n * avgCostPaise;
 }
+
+/**
+ * Ledger row math shared by every cash-movement call site. `amountPaise` is
+ * the row's impact on TOTAL cash (available + blocked margin + order
+ * reserves). Earmark events — margin blocks and order reserves — merely
+ * move money between the trader's own pockets, so their amount is ₹0 and
+ * the moved size rides in `detailPaise` for display. Only deposits, fills
+ * and settlements change the running balance, which makes the invariant
+ * provable: the sum of ledger amounts over a round trip = realized P&L.
+ */
+export function ledgerRowFor(
+  entryType: string,
+  deltaPaise: bigint,
+  marginDeltaPaise: bigint = 0n,
+): { amountPaise: bigint; detailPaise?: bigint } {
+  const abs = (x: bigint): bigint => (x < 0n ? -x : x);
+  const isEarmark =
+    entryType === "reserve" || entryType === "reserve_release" || entryType === "margin_block";
+  const detailPaise =
+    entryType === "reserve" || entryType === "reserve_release"
+      ? abs(deltaPaise)
+      : entryType === "margin_block"
+        ? marginDeltaPaise
+        : entryType === "cover_settle"
+          ? abs(marginDeltaPaise)
+          : undefined;
+  return {
+    amountPaise: isEarmark ? 0n : deltaPaise + marginDeltaPaise,
+    ...(detailPaise !== undefined ? { detailPaise } : {}),
+  };
+}

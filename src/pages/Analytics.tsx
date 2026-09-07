@@ -104,7 +104,10 @@ export default function Analytics() {
         : null;
 
   return (
-    <TradingShell active="analytics" cash={account?.availableCashPaise ?? 0n}>
+    <TradingShell
+      active="analytics"
+      cash={(account?.availableCashPaise ?? 0n) + (account?.marginBlockedPaise ?? 0n)}
+    >
       <PageHeader
         title="Trade analytics"
         sub="Automated performance statistics computed from your ledger and stored realized P&L. Equity is closing cash per UTC day; today is live (cash + holdings at LTP)."

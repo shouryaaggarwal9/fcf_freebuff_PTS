@@ -288,7 +288,7 @@ export function OrderTicket({
           </label>
           <span className="text-[10px] text-muted-foreground">
             {isShort
-              ? `SHORT ${heldQty} · margin ${formatINR(availableCashPaise)} cash`
+              ? `SHORT ${heldQty} · ${formatINR(availableCashPaise)} available`
               : isBuy
                 ? `Cash ${formatINR(availableCashPaise)}`
                 : heldQty > 0

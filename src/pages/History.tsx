@@ -126,7 +126,10 @@ export default function History() {
   );
 
   return (
-    <TradingShell active="history" cash={account?.availableCashPaise ?? 0n}>
+    <TradingShell
+      active="history"
+      cash={(account?.availableCashPaise ?? 0n) + (account?.marginBlockedPaise ?? 0n)}
+    >
       <PageHeader
         title="Order history"
         sub="Every order you have placed, with historical fill prices and realized P&L as stored at fill time by the settlement engine."
